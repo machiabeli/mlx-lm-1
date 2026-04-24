@@ -739,6 +739,57 @@ class Compressor(nn.Module):
         return pooled
 
 
+def _sparse_attn(
+    q: mx.array,
+    kv_flat: mx.array,
+    topk_idxs: mx.array,
+    attn_sink: mx.array,
+    scale: float,
+) -> mx.array:
+    """Pure-MLX sparse attention with a learnable per-head sink.
+
+    Args:
+        q:         [B, H, S, D] — multi-head queries.
+        kv_flat:   [B, 1, N, D] — single-head keys=values (V4 uses MLA).
+        topk_idxs: [B, S, K] int32 — per-query indices into kv_flat's N axis,
+                   -1 marks a padding slot (masked out).
+        attn_sink: [H] — per-head bias added to the softmax denominator.
+        scale:     float — usually head_dim**-0.5.
+
+    Returns:
+        [B, H, S, D] — the attention output.
+
+    Matches the online softmax from /tmp/dsv4-ref/kernel.py:293-352 — sinks
+    are *not* keys; they only appear in `sum_exp += exp(sink - max)`.
+    """
+    B, H, S, D = q.shape
+    N = kv_flat.shape[-2]
+    K = topk_idxs.shape[-1]
+
+    kv_2d = kv_flat[:, 0, :, :]  # [B, N, D]
+    safe_idx = mx.maximum(topk_idxs, 0)  # -1 -> 0 for safe gather, masked below
+    kv_broad = mx.broadcast_to(kv_flat, (B, S, N, D))
+    idx_expanded = mx.broadcast_to(safe_idx[..., None], (B, S, K, D))
+    gathered = mx.take_along_axis(kv_broad, idx_expanded, axis=2)  # [B, S, K, D]
+
+    scores = mx.einsum("bhsd,bskd->bhsk", q, gathered) * scale
+    valid = topk_idxs >= 0  # [B, S, K]
+    scores = mx.where(
+        valid[:, None, :, :],
+        scores,
+        mx.array(mx.finfo(scores.dtype).min, dtype=scores.dtype),
+    )
+
+    m_ = mx.max(scores, axis=-1, keepdims=True)
+    exp_scores = mx.exp(scores - m_)
+    sink = mx.exp(
+        attn_sink[None, :, None, None].astype(scores.dtype) - m_
+    )
+    denom = exp_scores.sum(axis=-1, keepdims=True) + sink
+    probs = exp_scores / denom
+    return mx.einsum("bhsk,bskd->bhsd", probs, gathered)
+
+
 class V4Attention(nn.Module):
     """V4 attention block.
 
@@ -930,22 +981,50 @@ class V4Attention(nn.Module):
             combined_k = win_k
             combined_v = win_v
 
-        # Causal mask over (window + compressed) for each of S queries.
-        # Query qi's absolute position = offset + qi. Window key wi (temporal)
-        # represents absolute position offset_new - win_len + wi, where
-        # offset_new = offset + S. Allowed iff win_key_pos <= qi_pos.
         offset_new = offset + S
         win_len = win_k.shape[-2]
         r = self.compress_ratio
+
+        # Ratio=4 layers gate compressed attention through Indexer top-k.
+        # Any other ratio attends to every compressed row (reference
+        # get_compress_topk_idxs behavior for non-indexer layers).
+        if r == 4 and hasattr(self, "indexer"):
+            # Window indices per query, with causality: wi <= win_len - S + qi.
+            qi = mx.arange(S, dtype=mx.int32)[:, None]
+            wi = mx.arange(win_len, dtype=mx.int32)[None, :]
+            win_valid = wi <= (win_len - S + qi)
+            win_topk_base = mx.where(
+                win_valid, wi, mx.array(-1, dtype=mx.int32)
+            )  # [S, win_len]
+            win_topk = mx.broadcast_to(
+                win_topk_base[None, :, :], (B, S, win_len)
+            )
+
+            # Compressed indices from Indexer (already offset by win_len).
+            # Note: Indexer operates on raw hidden state x and the attention
+            # path's qr — same semantics as reference line 511. We reuse the
+            # already-computed q_norm output via a fresh pass of wq_a+q_norm
+            # on x: qr is the pre-split representation, rebuilt here to keep
+            # this method self-contained.
+            qr_for_index = self.q_norm(self.wq_a(x))
+            comp_topk = self.indexer(
+                x, qr_for_index, start_pos=offset, offset=win_len
+            )
+            combined_topk = mx.concatenate([win_topk, comp_topk], axis=-1)
+
+            return _sparse_attn(
+                q, combined_k, combined_topk,
+                self.attn_sink.astype(q.dtype),
+                self.scale,
+            )
+
+        # Ratio != 4 (i.e. 128): mask-based dense attention over the whole
+        # combined buffer — no top-k filtering needed.
         qi = mx.arange(S)[:, None]
         wi = mx.arange(win_len)[None, :]
-        # offset_new - win_len + wi <= offset + qi  <=>  wi <= win_len - S + qi
         win_mask = wi <= (win_len - S + qi)
         if ncomp > 0:
             ji = mx.arange(ncomp)[None, :]
-            # compressed row j covers tokens [j*r, (j+1)*r). It is fully
-            # formed at absolute position (j+1)*r - 1. Allowed iff that
-            # position <= query's absolute position (offset + qi).
             comp_mask = ((ji + 1) * r - 1) <= (offset + qi)
             combined_mask = mx.concatenate([win_mask, comp_mask], axis=-1)
         else:

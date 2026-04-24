@@ -1611,6 +1611,129 @@ class TestModels(unittest.TestCase):
         outputs = model(next_chunk, cache=cache)
         self.assertEqual(outputs.shape, (1, 4, args.vocab_size))
 
+    def test_deepseek_v4_sparse_attn_matches_dense(self):
+        # When the Indexer picks every valid compressed position (index_topk
+        # >= n_compressed) AND every window position is selected, sparse_attn
+        # over the union must match dense SDPA over concat(win, compressed).
+        from mlx_lm.models import deepseek_v4
+
+        mx.random.seed(42)
+        B, H, S, D = 1, 4, 4, 16
+        N = 16  # combined key count
+        q = mx.random.normal((B, H, S, D), dtype=mx.float32)
+        kv = mx.random.normal((B, 1, N, D), dtype=mx.float32)
+        attn_sink = mx.full((H,), -1e9, dtype=mx.float32)  # negligible sink
+        scale = D ** -0.5
+
+        # All indices selected for every query.
+        all_idx = mx.broadcast_to(
+            mx.arange(N, dtype=mx.int32)[None, None, :], (B, S, N)
+        )
+        sparse_out = deepseek_v4._sparse_attn(q, kv, all_idx, attn_sink, scale)
+
+        # Dense reference: expand single-head KV to match Q heads.
+        k_bhnd = mx.broadcast_to(kv, (B, H, N, D))
+        dense_out = scaled_dot_product_attention(
+            q, k_bhnd, k_bhnd,
+            cache=None, scale=scale, mask=None,
+            sinks=attn_sink,
+        )
+
+        diff = mx.max(mx.abs(sparse_out - dense_out)).item()
+        self.assertLess(diff, 1e-3, f"sparse vs dense diff {diff}")
+
+    def test_deepseek_v4_sparse_attn_sink_semantics(self):
+        # attn_sink=-inf => pure softmax (output depends on K/V).
+        # attn_sink=+inf => sink dominates denom => output ~ 0.
+        from mlx_lm.models import deepseek_v4
+
+        mx.random.seed(43)
+        B, H, S, D = 1, 2, 2, 8
+        N = 4
+        q = mx.random.normal((B, H, S, D), dtype=mx.float32)
+        kv = mx.random.normal((B, 1, N, D), dtype=mx.float32)
+        scale = D ** -0.5
+        all_idx = mx.broadcast_to(
+            mx.arange(N, dtype=mx.int32)[None, None, :], (B, S, N)
+        )
+
+        # Very negative sink => ignored
+        out_low = deepseek_v4._sparse_attn(
+            q, kv, all_idx, mx.full((H,), -1e9, dtype=mx.float32), scale
+        )
+        # Dense SDPA with negligible sink => equivalent to no-sink softmax.
+        k_bhnd = mx.broadcast_to(kv, (B, H, N, D))
+        out_dense = scaled_dot_product_attention(
+            q, k_bhnd, k_bhnd, cache=None, scale=scale, mask=None, sinks=None,
+        )
+        diff = mx.max(mx.abs(out_low - out_dense)).item()
+        self.assertLess(diff, 1e-3, f"-inf sink diverged from no-sink: {diff}")
+
+        # Very positive sink => denom dominated by sink => outputs ~ 0.
+        out_high = deepseek_v4._sparse_attn(
+            q, kv, all_idx, mx.full((H,), 1e3, dtype=mx.float32), scale
+        )
+        self.assertLess(mx.max(mx.abs(out_high)).item(), 1e-2)
+
+    def test_deepseek_v4_ratio4_multi_turn_forward(self):
+        # End-to-end forward with indexer-gated sparse attention.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 4, 0, 4],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=128,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 64,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        for layer in model.model.layers:
+            layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+        cache = model.make_cache()
+
+        # Prefill 32 tokens. ratio=4 => 8 compressed rows per compressed layer.
+        prefill = mx.arange(32, dtype=mx.int32)[None, :]
+        out = model(prefill, cache=cache)
+        self.assertEqual(out.shape, (1, 32, args.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+
+        # Streamed decode.
+        for step in range(16):
+            token = mx.array([[32 + step]], dtype=mx.int32)
+            out = model(token, cache=cache)
+            self.assertEqual(out.shape, (1, 1, args.vocab_size))
+            self.assertTrue(
+                mx.all(mx.isfinite(out)).item(),
+                f"non-finite at decode step {step}",
+            )
+
     def _tiny_v4_args(self):
         # Shared tiny model config for Indexer unit tests. ratio=4 and
         # index_head_dim small so the math is cheap.

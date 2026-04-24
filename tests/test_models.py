@@ -1547,6 +1547,68 @@ class TestModels(unittest.TestCase):
             self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
             self.assertEqual(outputs.dtype, dtype)
 
+    def test_deepseek_v4_hybrid_attention_mask(self):
+        # Regression: V4 interleaves full-attention (KVCache) and
+        # sliding-window (RotatingKVCache) layers. A single mask built
+        # against cache[0] cannot satisfy both layer types once the
+        # sliding cache rotates past its window and a subsequent prefill
+        # with S > 1 runs. Prior to the per-layer-mask fix, this raised
+        # a broadcast_shapes ValueError inside scaled_dot_product_attention.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 4, 0, 4],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=128,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 64,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        for layer in model.model.layers:
+            layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+        cache = model.make_cache()
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], RotatingKVCache)
+        self.assertIsInstance(cache[3], KVCache)
+
+        # Prefill past sliding_window so the two cache types diverge in length.
+        prefill = mx.arange(12, dtype=mx.int32)[None, :]
+        _ = model(prefill, cache=cache)
+
+        # Second prefill with S > 1 — the failure mode the old mask
+        # construction hit in multi-turn chat.
+        next_chunk = mx.array([[100, 101, 102, 103]], dtype=mx.int32)
+        outputs = model(next_chunk, cache=cache)
+        self.assertEqual(outputs.shape, (1, 4, args.vocab_size))
+
     def test_mixed_quant_preserves_deepseek_v4_attention_paths(self):
         from mlx_lm.convert import mixed_quant_predicate_builder
         from mlx_lm.models import deepseek_v4

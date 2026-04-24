@@ -850,12 +850,30 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
         if cache is None:
             cache = [None] * self.num_layers
 
-        first_cache = cache[0]
-        if isinstance(first_cache, (list, tuple)):
-            first_cache = first_cache[0]
-        mask = create_attention_mask(
-            h[:, :, 0, :],
-            first_cache if first_cache is not None else None,
+        # V4 interleaves full-attention (KVCache) and sliding-window
+        # (RotatingKVCache) layers; a single mask built against cache[0]
+        # cannot match the other cache type's key length once the
+        # sliding cache rotates past its window. Build one mask per
+        # cache type and dispatch per layer (mirrors gemma3_text).
+        full_cache = None
+        slide_cache = None
+        for i in range(self.num_layers):
+            layer = self.layers[self.start_idx + i]
+            c = cache[i]
+            if isinstance(c, (list, tuple)):
+                c = c[0]
+            if layer.attn.compress_ratio and full_cache is None:
+                full_cache = c
+            elif not layer.attn.compress_ratio and slide_cache is None:
+                slide_cache = c
+            if full_cache is not None and slide_cache is not None:
+                break
+
+        h0 = h[:, :, 0, :]
+        full_mask = create_attention_mask(h0, full_cache, return_array=True)
+        slide_mask = create_attention_mask(
+            h0, slide_cache,
+            window_size=self.args.sliding_window,
             return_array=True,
         )
 
@@ -865,7 +883,9 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i], inputs)
+            layer = self.layers[self.start_idx + i]
+            layer_mask = full_mask if layer.attn.compress_ratio else slide_mask
+            h = layer(h, layer_mask, cache[i], inputs)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)

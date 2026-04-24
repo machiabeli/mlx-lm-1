@@ -17,7 +17,12 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, RotatingKVCache
+from .cache import (
+    CompressedKVCache,
+    HybridV4Cache,
+    KVCache,
+    RotatingKVCache,
+)
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
@@ -236,15 +241,17 @@ def _make_sinkhorn_kernel(hc: int, iters: int, eps: float):
     iter_body = "\n".join([row_norm(), col_norm()])
     inner_iters = "\n".join([iter_body] * (iters - 1))
 
+    # Direct indexing into the input/output buffers avoids declaring Metal
+    # intermediate pointers; MLX decides the address space of `comb_log` at
+    # runtime (constant vs. device) based on buffer size, and a pointer
+    # declaration with a hard-coded address space mismatches smaller shapes.
     source = f"""
         uint n = thread_position_in_grid.x;
         if (n >= n_tokens[0]) return;
 
-        const device float *src = comb_log + n * {n_elem};
-        device float *dst = comb + n * {n_elem};
-
+        uint base = n * {n_elem};
         float m[{n_elem}];
-{chr(10).join(f"        m[{i}] = src[{i}];" for i in range(n_elem))}
+{chr(10).join(f"        m[{i}] = comb_log[base + {i}];" for i in range(n_elem))}
 
         // Row softmax
 {row_softmax()}
@@ -258,7 +265,7 @@ def _make_sinkhorn_kernel(hc: int, iters: int, eps: float):
         // Remaining (iters - 1) rounds of (row_norm, col_norm)
 {inner_iters}
 
-{chr(10).join(f"        dst[{i}] = m[{i}];" for i in range(n_elem))}
+{chr(10).join(f"        comb[base + {i}] = m[{i}];" for i in range(n_elem))}
     """
 
     kernel = mx.fast.metal_kernel(
@@ -547,9 +554,13 @@ class DeepseekV4MoE(nn.Module):
 class Compressor(nn.Module):
     """Learned gated pooling over `ratio` consecutive tokens for KV compression.
 
-    At prefill, produces ~ seq/ratio compressed KV rows. At decode, accumulates
-    tokens in a state buffer and emits a compressed row every `ratio` steps.
-    Pure-MLX; a fused Metal kernel may replace this in a follow-up.
+    Prefill emits S // ratio compressed rows in one shot; decode accumulates
+    tokens in an internal state buffer and emits one compressed row every
+    `ratio` steps. RMS-norm and RoPE (at strided positions for prefill, at the
+    window start for decode) are applied to the pooled output before return.
+
+    Mirrors /tmp/dsv4-ref/model.py:279-377 semantics. Skips Hadamard rotation
+    and FP4/FP8 activation quantization (optimizations, not correctness).
     """
 
     def __init__(self, args: ModelArgs, compress_ratio: int, head_dim: int):
@@ -557,13 +568,33 @@ class Compressor(nn.Module):
         self.dim = args.hidden_size
         self.head_dim = head_dim
         self.rope_head_dim = args.qk_rope_head_dim
+        self.nope_head_dim = head_dim - args.qk_rope_head_dim
         self.ratio = compress_ratio
         self.overlap = compress_ratio == 4
-        out_dim = head_dim * (2 if self.overlap else 1)
+        self.coff = 2 if self.overlap else 1
+        self.eps = args.rms_norm_eps
+
+        out_dim = head_dim * self.coff
         self.wkv = nn.Linear(self.dim, out_dim, bias=False)
         self.wgate = nn.Linear(self.dim, out_dim, bias=False)
         self.ape = mx.zeros((compress_ratio, out_dim), dtype=mx.float32)
-        self.norm  = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.rope = DeepseekV4RoPE(
+            args.qk_rope_head_dim,
+            args.compress_rope_theta,
+            getattr(args, "rope_scaling", None),
+        )
+
+        # Decode-phase state lives in a dict to keep it out of MLX nn.Module's
+        # parameter registration (it's transient, not a learnable parameter).
+        self._decode_state = {}
+
+    def reset_state(self, batch_size: int):
+        buf_shape = (batch_size, self.coff * self.ratio, self.coff * self.head_dim)
+        self._decode_state["kv"] = mx.zeros(buf_shape, dtype=mx.float32)
+        self._decode_state["score"] = mx.full(
+            buf_shape, float("-inf"), dtype=mx.float32
+        )
 
     def _overlap_transform(self, tensor: mx.array, value: float) -> mx.array:
         B, S, R, _ = tensor.shape
@@ -573,24 +604,190 @@ class Compressor(nn.Module):
         out[:, 1:, :R] = tensor[:, :-1, :, :D]
         return out
 
-    def __call__(self, x: mx.array) -> mx.array:
-        # Prefill-only MVP: chunk x into windows of `ratio` tokens. Ratio-4
-        # layers use the overlapping layout from the reference implementation.
-        # Returns compressed KV: [B, S//ratio, head_dim] (bf16).
+    def _apply_rope_to_rows(self, rows: mx.array, positions) -> mx.array:
+        """rows: [B, N, head_dim]. Apply RoPE to last rope_head_dim dims at the
+        given list of integer positions (one per row). Non-rope prefix is
+        passed through unchanged."""
+        if self.rope_head_dim == 0 or rows.shape[1] == 0:
+            return rows
+        nope = rows[..., : self.nope_head_dim]
+        pe = rows[..., self.nope_head_dim :]
+        rotated = []
+        for i in range(rows.shape[1]):
+            rotated.append(self.rope(pe[:, i : i + 1, :], offset=int(positions[i])))
+        pe_out = mx.concatenate(rotated, axis=1)
+        return mx.concatenate([nope, pe_out], axis=-1)
+
+    def __call__(self, x: mx.array, start_pos: int = 0):
+        B, S, _ = x.shape
+        if (
+            "kv" not in self._decode_state
+            or self._decode_state["kv"].shape[0] < B
+        ):
+            self.reset_state(B)
+
+        if start_pos == 0:
+            return self._prefill(x)
+
+        # Non-zero start_pos: iterate decode steps. mlx_lm decode-loop is
+        # usually S==1, but multi-turn chat prefill lands here with S>1.
+        emitted = []
+        for i in range(S):
+            row = self._decode_step(x[:, i : i + 1, :], start_pos + i)
+            if row is not None:
+                emitted.append(row)
+        if emitted:
+            return mx.concatenate(emitted, axis=1)
+        return None
+
+    def _prefill(self, x: mx.array):
+        # /tmp/dsv4-ref/model.py:325-342, 362-374.
         B, S, _ = x.shape
         r = self.ratio
-        keep = (S // r) * r
-        if keep == 0:
-            return mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
-        xf = x[:, :keep].astype(mx.float32)
-        kv = self.wkv(xf).reshape(B, keep // r, r, -1)
-        score = self.wgate(xf).reshape(B, keep // r, r, -1) + self.ape
+        d = self.head_dim
+        coff = self.coff
+        in_dtype = x.dtype
+
+        xf = x.astype(mx.float32)
+        kv = self.wkv(xf)
+        score = self.wgate(xf)
+
+        should_compress = S >= r
+        remainder = S % r
+        cutoff = S - remainder
+        offset = r if self.overlap else 0
+
+        # Seed decode state so a subsequent token-by-token call continues the
+        # compression stream without discontinuity.
+        if self.overlap and cutoff >= r:
+            self._decode_state["kv"][:B, :r] = kv[:, cutoff - r : cutoff]
+            self._decode_state["score"][:B, :r] = (
+                score[:, cutoff - r : cutoff] + self.ape
+            )
+        if remainder > 0:
+            self._decode_state["kv"][:B, offset : offset + remainder] = kv[:, cutoff:]
+            self._decode_state["score"][:B, offset : offset + remainder] = (
+                score[:, cutoff:] + self.ape[:remainder]
+            )
+            kv = kv[:, :cutoff]
+            score = score[:, :cutoff]
+
+        if not should_compress:
+            return None
+
+        kv_chunk = kv.reshape(B, cutoff // r, r, coff * d)
+        score_chunk = score.reshape(B, cutoff // r, r, coff * d) + self.ape
         if self.overlap:
-            kv = self._overlap_transform(kv, 0.0)
-            score = self._overlap_transform(score, float("-inf"))
-        weights = mx.softmax(score, axis=2, precise=True)
-        kv = (kv * weights).sum(axis=2)
-        return self.norm(kv.astype(x.dtype))
+            kv_chunk = self._overlap_transform(kv_chunk, 0.0)
+            score_chunk = self._overlap_transform(score_chunk, float("-inf"))
+        weights = mx.softmax(score_chunk, axis=2, precise=True)
+        pooled = (kv_chunk * weights).sum(axis=2)
+
+        pooled = self.norm(pooled.astype(in_dtype))
+        positions = [i * r for i in range(pooled.shape[1])]
+        pooled = self._apply_rope_to_rows(pooled, positions)
+        return pooled
+
+    def _decode_step(self, x: mx.array, start_pos: int):
+        # /tmp/dsv4-ref/model.py:343-360, 362-366.
+        B = x.shape[0]
+        r = self.ratio
+        d = self.head_dim
+        in_dtype = x.dtype
+
+        xf = x.astype(mx.float32)
+        kv_t = self.wkv(xf).reshape(B, -1)
+        score_t = (self.wgate(xf) + self.ape[start_pos % r][None, None, :]).reshape(
+            B, -1
+        )
+
+        should_compress = (start_pos + 1) % r == 0
+
+        if self.overlap:
+            slot = r + (start_pos % r)
+            self._decode_state["kv"][:B, slot] = kv_t
+            self._decode_state["score"][:B, slot] = score_t
+            if not should_compress:
+                return None
+            kv_state = self._decode_state["kv"][:B]
+            score_state = self._decode_state["score"][:B]
+            kv_cat = mx.concatenate(
+                [kv_state[:, :r, :d], kv_state[:, r:, d:]], axis=1
+            )
+            score_cat = mx.concatenate(
+                [score_state[:, :r, :d], score_state[:, r:, d:]], axis=1
+            )
+            weights = mx.softmax(score_cat, axis=1, precise=True)
+            pooled = (kv_cat * weights).sum(axis=1, keepdims=True)
+            # Rotate the overlap half forward for the next window.
+            self._decode_state["kv"][:B, :r] = self._decode_state["kv"][:B, r:]
+            self._decode_state["score"][:B, :r] = self._decode_state["score"][:B, r:]
+        else:
+            slot = start_pos % r
+            self._decode_state["kv"][:B, slot] = kv_t
+            self._decode_state["score"][:B, slot] = score_t
+            if not should_compress:
+                return None
+            kv_state = self._decode_state["kv"][:B]
+            score_state = self._decode_state["score"][:B]
+            weights = mx.softmax(score_state, axis=1, precise=True)
+            pooled = (kv_state * weights).sum(axis=1, keepdims=True)
+
+        pooled = self.norm(pooled.astype(in_dtype))
+        positions = [start_pos + 1 - r]
+        pooled = self._apply_rope_to_rows(pooled, positions)
+        return pooled
+
+
+def _sparse_attn(
+    q: mx.array,
+    kv_flat: mx.array,
+    topk_idxs: mx.array,
+    attn_sink: mx.array,
+    scale: float,
+) -> mx.array:
+    """Pure-MLX sparse attention with a learnable per-head sink.
+
+    Args:
+        q:         [B, H, S, D] — multi-head queries.
+        kv_flat:   [B, 1, N, D] — single-head keys=values (V4 uses MLA).
+        topk_idxs: [B, S, K] int32 — per-query indices into kv_flat's N axis,
+                   -1 marks a padding slot (masked out).
+        attn_sink: [H] — per-head bias added to the softmax denominator.
+        scale:     float — usually head_dim**-0.5.
+
+    Returns:
+        [B, H, S, D] — the attention output.
+
+    Matches the online softmax from /tmp/dsv4-ref/kernel.py:293-352 — sinks
+    are *not* keys; they only appear in `sum_exp += exp(sink - max)`.
+    """
+    B, H, S, D = q.shape
+    N = kv_flat.shape[-2]
+    K = topk_idxs.shape[-1]
+
+    kv_2d = kv_flat[:, 0, :, :]  # [B, N, D]
+    safe_idx = mx.maximum(topk_idxs, 0)  # -1 -> 0 for safe gather, masked below
+    kv_broad = mx.broadcast_to(kv_flat, (B, S, N, D))
+    idx_expanded = mx.broadcast_to(safe_idx[..., None], (B, S, K, D))
+    gathered = mx.take_along_axis(kv_broad, idx_expanded, axis=2)  # [B, S, K, D]
+
+    scores = mx.einsum("bhsd,bskd->bhsk", q, gathered) * scale
+    valid = topk_idxs >= 0  # [B, S, K]
+    scores = mx.where(
+        valid[:, None, :, :],
+        scores,
+        mx.array(mx.finfo(scores.dtype).min, dtype=scores.dtype),
+    )
+
+    m_ = mx.max(scores, axis=-1, keepdims=True)
+    exp_scores = mx.exp(scores - m_)
+    sink = mx.exp(
+        attn_sink[None, :, None, None].astype(scores.dtype) - m_
+    )
+    denom = exp_scores.sum(axis=-1, keepdims=True) + sink
+    probs = exp_scores / denom
+    return mx.einsum("bhsk,bskd->bhsd", probs, gathered)
 
 
 class V4Attention(nn.Module):
@@ -715,63 +912,264 @@ class V4Attention(nn.Module):
         # --- Q ---
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        # RMS-normalize each head independently (matches ref: q *= rsqrt(mean(q^2)+eps))
         q = q * mx.rsqrt(q.square().mean(axis=-1, keepdims=True) + self.eps)
 
         # --- K = V (shared single-head) ---
         kv = self.kv_norm(self.wkv(x))
-        kv = kv.reshape(B, S, 1, self.head_dim).transpose(0, 2, 1, 3)   # [B, 1, S, head_dim]
+        kv = kv.reshape(B, S, 1, self.head_dim).transpose(0, 2, 1, 3)
 
         offset = cache.offset if cache is not None else 0
 
-        # Apply RoPE only to the last rope_head_dim dims
-        q_nope, q_pe = mx.split(q,  [self.nope_head_dim], axis=-1)
+        q_nope, q_pe = mx.split(q, [self.nope_head_dim], axis=-1)
         k_nope, k_pe = mx.split(kv, [self.nope_head_dim], axis=-1)
         q_pe = self.rope(q_pe, offset=offset)
         k_pe = self.rope(k_pe, offset=offset)
         q = mx.concatenate([q_nope, q_pe], axis=-1)
         k = v = mx.concatenate([k_nope, k_pe], axis=-1)
 
-        # Update KV cache
-        if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
-
-        # Standard SDPA (compressed KV + topk deferred to v0.2)
-        out = scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
-        )
+        if not self.compress_ratio:
+            # Pure sliding-window layer (ratio=0). Unchanged from the original
+            # path — uses the layer's RotatingKVCache and the outer mask.
+            if cache is not None:
+                k, v = cache.update_and_fetch(k, v)
+            out = scaled_dot_product_attention(
+                q, k, v,
+                cache=cache, scale=self.scale, mask=mask,
+                sinks=self.attn_sink.astype(q.dtype),
+            )
+        else:
+            # Compressed-attention layer. cache is a HybridV4Cache: one
+            # RotatingKVCache for the last sliding_window raw tokens, one
+            # CompressedKVCache for gated-pooled rows emitted every `ratio`
+            # tokens. Build the combined key set + a causal mask that respects
+            # each key's absolute token position. Phase-3 attends to all
+            # compressed rows (no Indexer top-k — that's Phase 4/5).
+            out = self._compressed_attention(q, k, v, x, offset, S, B, cache)
 
         out_nope, out_pe = mx.split(out, [self.nope_head_dim], axis=-1)
         out_pe = self.rope(out_pe, offset=offset, inverse=True)
         out = mx.concatenate([out_nope, out_pe], axis=-1)
 
-        # Grouped low-rank projection: [B, n_heads, S, head_dim] -> [B, S, n_heads*head_dim]
         out = out.transpose(0, 2, 1, 3).reshape(B, S, self.n_heads * self.head_dim)
         out = self._grouped_output_projection(out)
         return self.wo_b(out)
 
+    def _compressed_attention(self, q, k, v, x, offset, S, B, cache):
+        # Allow cache-less forward (used by some smoke tests): build a throw-
+        # away hybrid cache so the rest of the path is uniform.
+        if cache is None:
+            cache = HybridV4Cache(window_size=self.window)
+        # Update window cache (returns keys possibly in ring-buffer order once
+        # the rotating cache starts trimming; _temporal_order canonicalizes).
+        win_k, win_v = cache.window.update_and_fetch(k, v)
+        win_k = cache.window._temporal_order(win_k)
+        win_v = cache.window._temporal_order(win_v)
+
+        # Run Compressor on the raw hidden state. Emits 0+ compressed rows.
+        compressed_new = self.compressor(x, start_pos=offset)
+        if compressed_new is not None:
+            comp_kv = compressed_new[:, None, :, :]  # add head dim
+            cache.compressed.update_and_fetch(comp_kv, comp_kv)
+
+        ncomp = cache.compressed.offset
+        if ncomp > 0:
+            comp_k = cache.compressed.keys[..., :ncomp, :].astype(win_k.dtype)
+            comp_v = cache.compressed.values[..., :ncomp, :].astype(win_v.dtype)
+            combined_k = mx.concatenate([win_k, comp_k], axis=-2)
+            combined_v = mx.concatenate([win_v, comp_v], axis=-2)
+        else:
+            combined_k = win_k
+            combined_v = win_v
+
+        offset_new = offset + S
+        win_len = win_k.shape[-2]
+        r = self.compress_ratio
+
+        # Ratio=4 layers gate compressed attention through Indexer top-k.
+        # Any other ratio attends to every compressed row (reference
+        # get_compress_topk_idxs behavior for non-indexer layers).
+        if r == 4 and hasattr(self, "indexer"):
+            # Window indices per query, with causality: wi <= win_len - S + qi.
+            qi = mx.arange(S, dtype=mx.int32)[:, None]
+            wi = mx.arange(win_len, dtype=mx.int32)[None, :]
+            win_valid = wi <= (win_len - S + qi)
+            win_topk_base = mx.where(
+                win_valid, wi, mx.array(-1, dtype=mx.int32)
+            )  # [S, win_len]
+            win_topk = mx.broadcast_to(
+                win_topk_base[None, :, :], (B, S, win_len)
+            )
+
+            # Compressed indices from Indexer (already offset by win_len).
+            # Note: Indexer operates on raw hidden state x and the attention
+            # path's qr — same semantics as reference line 511. We reuse the
+            # already-computed q_norm output via a fresh pass of wq_a+q_norm
+            # on x: qr is the pre-split representation, rebuilt here to keep
+            # this method self-contained.
+            qr_for_index = self.q_norm(self.wq_a(x))
+            comp_topk = self.indexer(
+                x, qr_for_index, start_pos=offset, offset=win_len
+            )
+            combined_topk = mx.concatenate([win_topk, comp_topk], axis=-1)
+
+            return _sparse_attn(
+                q, combined_k, combined_topk,
+                self.attn_sink.astype(q.dtype),
+                self.scale,
+            )
+
+        # Ratio != 4 (i.e. 128): mask-based dense attention over the whole
+        # combined buffer — no top-k filtering needed.
+        qi = mx.arange(S)[:, None]
+        wi = mx.arange(win_len)[None, :]
+        win_mask = wi <= (win_len - S + qi)
+        if ncomp > 0:
+            ji = mx.arange(ncomp)[None, :]
+            comp_mask = ((ji + 1) * r - 1) <= (offset + qi)
+            combined_mask = mx.concatenate([win_mask, comp_mask], axis=-1)
+        else:
+            combined_mask = win_mask
+
+        return scaled_dot_product_attention(
+            q, combined_k, combined_v,
+            cache=None,
+            scale=self.scale,
+            mask=combined_mask,
+            sinks=self.attn_sink.astype(q.dtype),
+        )
+
 
 class Indexer(nn.Module):
-    """Top-k selector over compressed KV rows. For MVP we instantiate to preserve
-    checkpoint parameter names; the actual topk gather path is not yet used in
-    the forward pass (we attend to all compressed rows in v0.1)."""
+    """Top-k selector over compressed KV rows for ratio=4 layers.
+
+    Has its own Compressor (separate weights from the Attention's main
+    Compressor) that maintains an independent compressed KV buffer used for
+    scoring. Returns per-query top-k indices into the combined (window +
+    compressed) key buffer — callers add `offset` so indices land in the
+    compressed region.
+
+    Mirrors /tmp/dsv4-ref/model.py:380-433. Skips the Hadamard rotation
+    and FP4 activation quantization of the reference (optimizations).
+    """
 
     def __init__(self, args: ModelArgs, compress_ratio: int):
         super().__init__()
         self.dim = args.hidden_size
         self.n_heads = args.index_n_heads
         self.head_dim = args.index_head_dim
+        self.rope_head_dim = args.qk_rope_head_dim
+        self.nope_head_dim = self.head_dim - args.qk_rope_head_dim
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
+        self.compress_ratio = compress_ratio
+        self.softmax_scale = self.head_dim ** -0.5
+
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.compressor = Compressor(args, compress_ratio, self.head_dim)
+        self.rope = DeepseekV4RoPE(
+            args.qk_rope_head_dim,
+            args.compress_rope_theta,
+            getattr(args, "rope_scaling", None),
+        )
+
+        # Indexer's own compressed KV buffer (separate from the attention's
+        # HybridV4Cache.compressed). Keyed in a dict so MLX nn.Module does
+        # not auto-register it as a parameter.
+        self._kv_rows = {"tensor": None}
+
+    def reset_rows(self):
+        self._kv_rows["tensor"] = None
+        self.compressor.reset_state(1)
+
+    def __call__(
+        self,
+        x: mx.array,
+        qr: mx.array,
+        start_pos: int,
+        offset: int,
+    ) -> mx.array:
+        B, S, _ = x.shape
+        r = self.compress_ratio
+
+        # Fresh conversation: clear state so prior turns don't leak in.
+        if start_pos == 0:
+            self._kv_rows["tensor"] = None
+            self.compressor.reset_state(B)
+
+        # Update Indexer's own compressed KV stream.
+        comp_new = self.compressor(x, start_pos=start_pos)
+        if comp_new is not None:
+            if self._kv_rows["tensor"] is None:
+                self._kv_rows["tensor"] = comp_new
+            else:
+                self._kv_rows["tensor"] = mx.concatenate(
+                    [self._kv_rows["tensor"], comp_new], axis=1
+                )
+
+        # Short-circuit when nothing to select from: return all-invalid pad.
+        kv_cache = self._kv_rows["tensor"]
+        if kv_cache is None or kv_cache.shape[1] == 0:
+            return mx.full((B, S, self.index_topk), -1, dtype=mx.int32)
+
+        # Q path: project, reshape, apply RoPE to the last rope_head_dim dims.
+        q = (
+            self.wq_b(qr)
+            .reshape(B, S, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)  # [B, H, S, head_dim]
+        )
+        q_nope, q_pe = mx.split(q, [self.nope_head_dim], axis=-1)
+        q_pe = self.rope(q_pe, offset=start_pos)
+        q = mx.concatenate([q_nope, q_pe], axis=-1)
+
+        # Number of compressed rows "live" at query's current absolute pos.
+        end_pos = start_pos + S
+        n_live = min(kv_cache.shape[1], end_pos // r if end_pos >= r else 0)
+        if n_live == 0:
+            return mx.full((B, S, self.index_topk), -1, dtype=mx.int32)
+        kv_live = kv_cache[:, :n_live, :].astype(q.dtype)  # [B, N, head_dim]
+
+        weights = self.weights_proj(x) * (
+            self.softmax_scale * self.n_heads ** -0.5
+        )  # [B, S, H]
+        weights = weights.transpose(0, 2, 1)  # [B, H, S]
+
+        # scores[b, h, s, t] = <q[b, h, s], kv_live[b, t]>
+        scores = mx.einsum("bhsd,btd->bhst", q, kv_live)
+        scores = mx.maximum(scores, 0.0) * weights[..., None]  # relu * head weight
+        scores = scores.sum(axis=1)  # reduce heads -> [B, S, N]
+
+        # Causality (prefill only): query at token (start_pos + qi) can see
+        # compressed row j iff (j+1)*r - 1 <= start_pos + qi.
+        if start_pos == 0:
+            qi = mx.arange(1, S + 1)[:, None]  # [S, 1]
+            ji = mx.arange(n_live)[None, :]  # [1, N]
+            invalid = ji >= (qi // r)
+            scores = mx.where(invalid, mx.array(float("-inf"), scores.dtype), scores)
+
+        k_eff = min(self.index_topk, n_live)
+        if k_eff < n_live:
+            topk = mx.argpartition(-scores, kth=k_eff - 1, axis=-1)[..., :k_eff]
+        else:
+            topk = mx.argsort(-scores, axis=-1)[..., :k_eff]
+        topk = topk.astype(mx.int32)
+
+        # Re-mask causality-violating selections as -1; shift by offset so
+        # indices point into the compressed region of the combined buffer.
+        if start_pos == 0:
+            qi = mx.arange(1, S + 1)[:, None]
+            invalid = topk >= (qi // r).astype(mx.int32)
+            topk = mx.where(invalid, mx.array(-1, dtype=mx.int32), topk + offset)
+        else:
+            topk = topk + offset
+
+        # Pad to index_topk so callers can rely on a fixed trailing dim.
+        if k_eff < self.index_topk:
+            pad = mx.full(
+                (B, S, self.index_topk - k_eff), -1, dtype=mx.int32
+            )
+            topk = mx.concatenate([topk, pad], axis=-1)
+        return topk
 
 
 # --------------------------------------------------------------------------- #
@@ -850,12 +1248,30 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
         if cache is None:
             cache = [None] * self.num_layers
 
-        first_cache = cache[0]
-        if isinstance(first_cache, (list, tuple)):
-            first_cache = first_cache[0]
-        mask = create_attention_mask(
-            h[:, :, 0, :],
-            first_cache if first_cache is not None else None,
+        # V4 interleaves full-attention (KVCache) and sliding-window
+        # (RotatingKVCache) layers; a single mask built against cache[0]
+        # cannot match the other cache type's key length once the
+        # sliding cache rotates past its window. Build one mask per
+        # cache type and dispatch per layer (mirrors gemma3_text).
+        full_cache = None
+        slide_cache = None
+        for i in range(self.num_layers):
+            layer = self.layers[self.start_idx + i]
+            c = cache[i]
+            if isinstance(c, (list, tuple)):
+                c = c[0]
+            if layer.attn.compress_ratio and full_cache is None:
+                full_cache = c
+            elif not layer.attn.compress_ratio and slide_cache is None:
+                slide_cache = c
+            if full_cache is not None and slide_cache is not None:
+                break
+
+        h0 = h[:, :, 0, :]
+        full_mask = create_attention_mask(h0, full_cache, return_array=True)
+        slide_mask = create_attention_mask(
+            h0, slide_cache,
+            window_size=self.args.sliding_window,
             return_array=True,
         )
 
@@ -865,7 +1281,9 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i], inputs)
+            layer = self.layers[self.start_idx + i]
+            layer_mask = full_mask if layer.attn.compress_ratio else slide_mask
+            h = layer(h, layer_mask, cache[i], inputs)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -911,10 +1329,10 @@ class Model(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.attn.compress_ratio:
-                # Full cache for compressed-attention layers (MVP: no topk selection)
-                caches.append(KVCache())
+                # Compressed-attention layers: window (last sliding_window raw
+                # tokens) + compressed KV rows emitted every `ratio` tokens.
+                caches.append(HybridV4Cache(window_size=self.args.sliding_window))
             else:
-                # Sliding-window cache for pure local-attention layers
                 caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches
 

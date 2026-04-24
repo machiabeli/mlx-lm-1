@@ -1538,14 +1538,646 @@ class TestModels(unittest.TestCase):
             self.assertEqual(outputs.dtype, dtype)
 
             cache = model.make_cache()
+            from mlx_lm.models.cache import HybridV4Cache
             self.assertIsInstance(cache[0], RotatingKVCache)
-            self.assertIsInstance(cache[2], KVCache)
+            self.assertIsInstance(cache[2], HybridV4Cache)
             outputs = model(inputs[:, :3], cache=cache)
             self.assertEqual(outputs.shape, (1, 3, args.vocab_size))
             self.assertEqual(outputs.dtype, dtype)
             outputs = model(inputs[:, 3:4], cache=cache)
             self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
             self.assertEqual(outputs.dtype, dtype)
+
+    def test_deepseek_v4_hybrid_attention_mask(self):
+        # Regression: V4 interleaves full-attention (KVCache) and
+        # sliding-window (RotatingKVCache) layers. A single mask built
+        # against cache[0] cannot satisfy both layer types once the
+        # sliding cache rotates past its window and a subsequent prefill
+        # with S > 1 runs. Prior to the per-layer-mask fix, this raised
+        # a broadcast_shapes ValueError inside scaled_dot_product_attention.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 4, 0, 4],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=128,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 64,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        for layer in model.model.layers:
+            layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+        cache = model.make_cache()
+        from mlx_lm.models.cache import HybridV4Cache
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], HybridV4Cache)
+        self.assertIsInstance(cache[2], RotatingKVCache)
+        self.assertIsInstance(cache[3], HybridV4Cache)
+
+        # Prefill past sliding_window so the two cache types diverge in length.
+        prefill = mx.arange(12, dtype=mx.int32)[None, :]
+        _ = model(prefill, cache=cache)
+
+        # Second prefill with S > 1 — the failure mode the old mask
+        # construction hit in multi-turn chat.
+        next_chunk = mx.array([[100, 101, 102, 103]], dtype=mx.int32)
+        outputs = model(next_chunk, cache=cache)
+        self.assertEqual(outputs.shape, (1, 4, args.vocab_size))
+
+    def test_deepseek_v4_sparse_attn_matches_dense(self):
+        # When the Indexer picks every valid compressed position (index_topk
+        # >= n_compressed) AND every window position is selected, sparse_attn
+        # over the union must match dense SDPA over concat(win, compressed).
+        from mlx_lm.models import deepseek_v4
+
+        mx.random.seed(42)
+        B, H, S, D = 1, 4, 4, 16
+        N = 16  # combined key count
+        q = mx.random.normal((B, H, S, D), dtype=mx.float32)
+        kv = mx.random.normal((B, 1, N, D), dtype=mx.float32)
+        attn_sink = mx.full((H,), -1e9, dtype=mx.float32)  # negligible sink
+        scale = D ** -0.5
+
+        # All indices selected for every query.
+        all_idx = mx.broadcast_to(
+            mx.arange(N, dtype=mx.int32)[None, None, :], (B, S, N)
+        )
+        sparse_out = deepseek_v4._sparse_attn(q, kv, all_idx, attn_sink, scale)
+
+        # Dense reference: expand single-head KV to match Q heads.
+        k_bhnd = mx.broadcast_to(kv, (B, H, N, D))
+        dense_out = scaled_dot_product_attention(
+            q, k_bhnd, k_bhnd,
+            cache=None, scale=scale, mask=None,
+            sinks=attn_sink,
+        )
+
+        diff = mx.max(mx.abs(sparse_out - dense_out)).item()
+        self.assertLess(diff, 1e-3, f"sparse vs dense diff {diff}")
+
+    def test_deepseek_v4_sparse_attn_sink_semantics(self):
+        # attn_sink=-inf => pure softmax (output depends on K/V).
+        # attn_sink=+inf => sink dominates denom => output ~ 0.
+        from mlx_lm.models import deepseek_v4
+
+        mx.random.seed(43)
+        B, H, S, D = 1, 2, 2, 8
+        N = 4
+        q = mx.random.normal((B, H, S, D), dtype=mx.float32)
+        kv = mx.random.normal((B, 1, N, D), dtype=mx.float32)
+        scale = D ** -0.5
+        all_idx = mx.broadcast_to(
+            mx.arange(N, dtype=mx.int32)[None, None, :], (B, S, N)
+        )
+
+        # Very negative sink => ignored
+        out_low = deepseek_v4._sparse_attn(
+            q, kv, all_idx, mx.full((H,), -1e9, dtype=mx.float32), scale
+        )
+        # Dense SDPA with negligible sink => equivalent to no-sink softmax.
+        k_bhnd = mx.broadcast_to(kv, (B, H, N, D))
+        out_dense = scaled_dot_product_attention(
+            q, k_bhnd, k_bhnd, cache=None, scale=scale, mask=None, sinks=None,
+        )
+        diff = mx.max(mx.abs(out_low - out_dense)).item()
+        self.assertLess(diff, 1e-3, f"-inf sink diverged from no-sink: {diff}")
+
+        # Very positive sink => denom dominated by sink => outputs ~ 0.
+        out_high = deepseek_v4._sparse_attn(
+            q, kv, all_idx, mx.full((H,), 1e3, dtype=mx.float32), scale
+        )
+        self.assertLess(mx.max(mx.abs(out_high)).item(), 1e-2)
+
+    def test_deepseek_v4_ratio4_multi_turn_forward(self):
+        # End-to-end forward with indexer-gated sparse attention.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 4, 0, 4],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=128,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 64,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        for layer in model.model.layers:
+            layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+        cache = model.make_cache()
+
+        # Prefill 32 tokens. ratio=4 => 8 compressed rows per compressed layer.
+        prefill = mx.arange(32, dtype=mx.int32)[None, :]
+        out = model(prefill, cache=cache)
+        self.assertEqual(out.shape, (1, 32, args.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+
+        # Streamed decode.
+        for step in range(16):
+            token = mx.array([[32 + step]], dtype=mx.int32)
+            out = model(token, cache=cache)
+            self.assertEqual(out.shape, (1, 1, args.vocab_size))
+            self.assertTrue(
+                mx.all(mx.isfinite(out)).item(),
+                f"non-finite at decode step {step}",
+            )
+
+    def _tiny_v4_args(self):
+        # Shared tiny model config for Indexer unit tests. ratio=4 and
+        # index_head_dim small so the math is cheap.
+        from mlx_lm.models import deepseek_v4
+        return deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=32,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[4],
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=0,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=128,
+            compress_rope_theta=160000.0,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 64,
+                "type": "yarn",
+            },
+        )
+
+    def test_deepseek_v4_indexer_shape_and_dtype(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = self._tiny_v4_args()
+        mx.random.seed(5)
+        indexer = deepseek_v4.Indexer(args, compress_ratio=4)
+        indexer.compressor.ape = mx.random.normal(
+            (4, 2 * args.index_head_dim), dtype=mx.float32
+        )
+        mx.eval(indexer.parameters())
+
+        B, S = 1, 16
+        x = mx.random.normal((B, S, args.hidden_size), dtype=mx.float32)
+        qr = mx.random.normal((B, S, args.q_lora_rank), dtype=mx.float32)
+
+        topk = indexer(x, qr, start_pos=0, offset=0)
+        self.assertEqual(topk.shape, (B, S, args.index_topk))
+        self.assertEqual(topk.dtype, mx.int32)
+
+    def test_deepseek_v4_indexer_causality(self):
+        # Prefill S=20 tokens, ratio=4 => up to 5 compressed rows. For each
+        # query qi, every non-(-1) top-k entry must point to a compressed row
+        # fully formed by token qi, i.e. (j+1)*4 - 1 <= qi  <=>  j < (qi+1)/4.
+        from mlx_lm.models import deepseek_v4
+
+        args = self._tiny_v4_args()
+        mx.random.seed(7)
+        indexer = deepseek_v4.Indexer(args, compress_ratio=4)
+        indexer.compressor.ape = mx.random.normal(
+            (4, 2 * args.index_head_dim), dtype=mx.float32
+        )
+        mx.eval(indexer.parameters())
+
+        B, S = 1, 20
+        x = mx.random.normal((B, S, args.hidden_size), dtype=mx.float32)
+        qr = mx.random.normal((B, S, args.q_lora_rank), dtype=mx.float32)
+
+        offset = 100  # arbitrary non-zero offset to exercise the index shift
+        topk = indexer(x, qr, start_pos=0, offset=offset)
+
+        # Convert to numpy for simple per-row inspection.
+        topk_np = topk.tolist()[0]  # [S][K]
+        for qi, row in enumerate(topk_np):
+            max_valid_j = (qi + 1) // 4 - 1  # row j allowed iff j <= max_valid_j
+            for val in row:
+                if val == -1:
+                    continue
+                # Selected index is offset + j ; recover j
+                j = val - offset
+                self.assertGreaterEqual(
+                    j, 0, f"qi={qi}: j={j} is negative (offset subtract wrong)"
+                )
+                self.assertLessEqual(
+                    j, max_valid_j,
+                    f"qi={qi}: selected j={j} violates causality "
+                    f"(max allowed j={max_valid_j})",
+                )
+
+    def test_deepseek_v4_indexer_determinism(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = self._tiny_v4_args()
+        mx.random.seed(9)
+        indexer = deepseek_v4.Indexer(args, compress_ratio=4)
+        indexer.compressor.ape = mx.random.normal(
+            (4, 2 * args.index_head_dim), dtype=mx.float32
+        )
+        mx.eval(indexer.parameters())
+
+        B, S = 1, 12
+        x = mx.random.normal((B, S, args.hidden_size), dtype=mx.float32)
+        qr = mx.random.normal((B, S, args.q_lora_rank), dtype=mx.float32)
+
+        topk_a = indexer(x, qr, start_pos=0, offset=0)
+        topk_b = indexer(x, qr, start_pos=0, offset=0)
+        self.assertTrue(mx.array_equal(topk_a, topk_b))
+
+    def test_deepseek_v4_make_cache_hybrid(self):
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.cache import (
+            HybridV4Cache, RotatingKVCache, CompressedKVCache,
+        )
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 128, 0, 128],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=512,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 256,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        cache = model.make_cache()
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], HybridV4Cache)
+        self.assertIsInstance(cache[2], RotatingKVCache)
+        self.assertIsInstance(cache[3], HybridV4Cache)
+        # Hybrid layer's sub-caches must also be the right types.
+        self.assertIsInstance(cache[1].window, RotatingKVCache)
+        self.assertIsInstance(cache[1].compressed, CompressedKVCache)
+        self.assertEqual(cache[1].window.max_size, args.sliding_window)
+
+    def test_deepseek_v4_ratio128_multi_turn_forward(self):
+        # End-to-end forward: prefill + streamed decode through a hybrid
+        # (ratio=0 / ratio=128) stack. Emission happens once compressed
+        # history reaches 128 tokens; test uses prefill=256 to guarantee
+        # at least two compressed rows are emitted and attended to.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 128, 0, 128],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=512,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 256,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        for layer in model.model.layers:
+            layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+        cache = model.make_cache()
+
+        # Prefill 256 tokens. Compressed layers should emit 256/128 = 2 rows.
+        prefill = mx.arange(256, dtype=mx.int32)[None, :]
+        out = model(prefill, cache=cache)
+        self.assertEqual(out.shape, (1, 256, args.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+        # Compressed sub-caches should have 2 rows each for ratio=128 layers.
+        for i, layer in enumerate(model.model.layers):
+            if layer.attn.compress_ratio:
+                self.assertEqual(cache[i].compressed.offset, 2,
+                                 f"layer {i} expected 2 compressed rows")
+
+        # Streamed decode: 8 tokens, one at a time.
+        for step in range(8):
+            token = mx.array([[256 + step]], dtype=mx.int32)
+            out = model(token, cache=cache)
+            self.assertEqual(out.shape, (1, 1, args.vocab_size))
+            self.assertTrue(
+                mx.all(mx.isfinite(out)).item(),
+                f"non-finite output at decode step {step}",
+            )
+
+    def test_deepseek_v4_compressor_prefill_decode_parity_ratio4(self):
+        # Ratio=4 with overlap: prefill one shot vs token-by-token decode must
+        # produce identical compressed rows (within fp32 tolerance), because
+        # the decode-phase state machine is designed to mirror what prefill
+        # computes with overlap_transform. Mirrors reference model.py:316-377.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=32,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[4],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=0,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=128,
+            compress_rope_theta=160000.0,
+        )
+        mx.random.seed(0)
+        compressor = deepseek_v4.Compressor(args, compress_ratio=4, head_dim=args.head_dim)
+        # Randomize weights deterministically (default init is zeros for ape,
+        # nn.Linear is already random-init'd).
+        compressor.ape = mx.random.normal((4, 2 * args.head_dim), dtype=mx.float32)
+        mx.eval(compressor.parameters())
+
+        # 16 tokens => 4 compressed rows.
+        x = mx.random.normal((1, 16, args.hidden_size), dtype=mx.float32)
+
+        # Prefill path.
+        compressor.reset_state(1)
+        out_prefill = compressor(x, start_pos=0)
+        self.assertIsNotNone(out_prefill)
+        self.assertEqual(out_prefill.shape, (1, 4, args.head_dim))
+
+        # Streamed decode path.
+        compressor.reset_state(1)
+        streamed = []
+        for t in range(16):
+            row = compressor(x[:, t : t + 1, :], start_pos=t)
+            if row is not None:
+                streamed.append(row)
+        self.assertEqual(len(streamed), 4)
+        out_stream = mx.concatenate(streamed, axis=1)
+        self.assertEqual(out_stream.shape, (1, 4, args.head_dim))
+
+        # Parity within fp32 tolerance. The pooling is fp32 internally, final
+        # cast back to input dtype (float32 here).
+        diff = mx.max(mx.abs(out_prefill - out_stream)).item()
+        self.assertLess(diff, 1e-4, f"prefill/decode parity failed: max diff {diff}")
+
+    def test_deepseek_v4_compressor_prefill_decode_parity_ratio128(self):
+        # Non-overlap path (ratio != 4). 256 tokens => 2 rows.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=32,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[128],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=0,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=512,
+            compress_rope_theta=160000.0,
+        )
+        mx.random.seed(1)
+        compressor = deepseek_v4.Compressor(args, compress_ratio=128, head_dim=args.head_dim)
+        compressor.ape = mx.random.normal((128, args.head_dim), dtype=mx.float32)
+        mx.eval(compressor.parameters())
+
+        x = mx.random.normal((1, 256, args.hidden_size), dtype=mx.float32)
+
+        compressor.reset_state(1)
+        out_prefill = compressor(x, start_pos=0)
+        self.assertEqual(out_prefill.shape, (1, 2, args.head_dim))
+
+        compressor.reset_state(1)
+        streamed = []
+        for t in range(256):
+            row = compressor(x[:, t : t + 1, :], start_pos=t)
+            if row is not None:
+                streamed.append(row)
+        self.assertEqual(len(streamed), 2)
+        out_stream = mx.concatenate(streamed, axis=1)
+
+        diff = mx.max(mx.abs(out_prefill - out_stream)).item()
+        self.assertLess(diff, 1e-4, f"prefill/decode parity failed: max diff {diff}")
+
+    def test_deepseek_v4_compressed_kv_cache_roundtrip(self):
+        from mlx_lm.models.cache import CompressedKVCache
+
+        cache = CompressedKVCache()
+        self.assertTrue(cache.empty())
+        self.assertEqual(cache.offset, 0)
+        self.assertEqual(cache.nbytes, 0)
+
+        # Append 3 compressed rows (single-head: [B, 1, S, D]).
+        k0 = mx.random.uniform(shape=(1, 1, 3, 16))
+        v0 = mx.random.uniform(shape=(1, 1, 3, 16))
+        k_up, v_up = cache.update_and_fetch(k0, v0)
+        self.assertEqual(cache.offset, 3)
+        self.assertFalse(cache.empty())
+        self.assertEqual(k_up.shape, (1, 1, 3, 16))
+        self.assertTrue(mx.array_equal(k_up, k0))
+        self.assertTrue(mx.array_equal(v_up, v0))
+
+        # Append 1 more row.
+        k1 = mx.random.uniform(shape=(1, 1, 1, 16))
+        v1 = mx.random.uniform(shape=(1, 1, 1, 16))
+        k_up, v_up = cache.update_and_fetch(k1, v1)
+        self.assertEqual(cache.offset, 4)
+        self.assertEqual(k_up.shape, (1, 1, 4, 16))
+        self.assertTrue(mx.array_equal(k_up[..., 3:, :], k1))
+
+        # Append 7 more rows (forces buffer grow past initial step=64).
+        k2 = mx.random.uniform(shape=(1, 1, 7, 16))
+        v2 = mx.random.uniform(shape=(1, 1, 7, 16))
+        k_up, v_up = cache.update_and_fetch(k2, v2)
+        self.assertEqual(cache.offset, 11)
+        self.assertTrue(mx.array_equal(k_up[..., 4:, :], k2))
+
+        # nbytes tracks bytes of stored keys+values (visible portion or full buffer).
+        self.assertGreater(cache.nbytes, 0)
+
+        # State round-trip via from_state.
+        state = cache.state
+        meta = cache.meta_state
+        restored = CompressedKVCache.from_state(state, meta)
+        self.assertEqual(restored.offset, cache.offset)
+        self.assertTrue(mx.array_equal(restored.update_and_fetch(
+            mx.zeros((1, 1, 0, 16)), mx.zeros((1, 1, 0, 16))
+        )[0][..., : cache.offset, :], k_up))
+
+        # Trim by rows.
+        trimmed = cache.trim(3)
+        self.assertEqual(trimmed, 3)
+        self.assertEqual(cache.offset, 8)
+        # Trim more than offset only removes offset.
+        trimmed = cache.trim(100)
+        self.assertEqual(trimmed, 8)
+        self.assertEqual(cache.offset, 0)
+
+    def test_deepseek_v4_hybrid_cache_composite(self):
+        from mlx_lm.models.cache import HybridV4Cache, RotatingKVCache, CompressedKVCache
+
+        cache = HybridV4Cache(window_size=8)
+        self.assertIsInstance(cache.window, RotatingKVCache)
+        self.assertIsInstance(cache.compressed, CompressedKVCache)
+        self.assertEqual(cache.offset, 0)
+        self.assertTrue(cache.empty())
+
+        # Feed 12 tokens to window cache (sliding, max_size=8).
+        k = mx.random.uniform(shape=(1, 1, 12, 16))
+        v = mx.random.uniform(shape=(1, 1, 12, 16))
+        cache.window.update_and_fetch(k, v)
+        self.assertEqual(cache.offset, 12)  # window tracks total tokens
+        self.assertFalse(cache.empty())
+
+        # Append 3 compressed rows.
+        cr = mx.random.uniform(shape=(1, 1, 3, 16))
+        cache.compressed.update_and_fetch(cr, cr)
+        self.assertEqual(cache.compressed.offset, 3)
+
+        # State round-trip.
+        state = cache.state
+        meta = cache.meta_state
+        restored = HybridV4Cache.from_state(state, meta)
+        self.assertEqual(restored.offset, cache.offset)
+        self.assertEqual(restored.compressed.offset, 3)
+        self.assertEqual(restored.window.max_size, 8)
+
+        # make_mask delegates to window (sliding mask behavior).
+        mask = cache.make_mask(1, window_size=8)
+        # With offset==12 and max_size==8 already rotated, sliding mask exists
+        # for decode step N=1 when offset >= window_size.
+        self.assertTrue(mask is None or mask.ndim >= 1)
+
+        # nbytes sums sub-caches.
+        self.assertEqual(cache.nbytes, cache.window.nbytes + cache.compressed.nbytes)
 
     def test_mixed_quant_preserves_deepseek_v4_attention_paths(self):
         from mlx_lm.convert import mixed_quant_predicate_builder

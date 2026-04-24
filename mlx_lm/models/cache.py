@@ -407,6 +407,162 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class CompressedKVCache(_BaseCache):
+    """Append-only single-head KV store for DeepSeek-V4 compressed rows.
+
+    Rows are appended at discrete steps (once every `ratio` tokens during
+    decode; once per compressed chunk during prefill) rather than every token.
+    Stored layout matches single-head KV tensors: [B, 1, n_rows, head_dim].
+    """
+
+    step = 64
+
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys, values):
+        # keys/values: [B, 1, S, D] — S may be 0 for a no-op fetch.
+        prev = self.offset
+        S = keys.shape[2]
+        if self.keys is None or (prev + S) > self.keys.shape[2]:
+            B, n_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            n_steps = max(1, (self.step + S - 1) // self.step)
+            k_shape = (B, n_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_heads, n_steps * self.step, v_head_dim)
+            new_k = mx.zeros(k_shape, keys.dtype)
+            new_v = mx.zeros(v_shape, values.dtype)
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = self.keys[..., :prev, :]
+                    self.values = self.values[..., :prev, :]
+                self.keys = mx.concatenate([self.keys, new_k], axis=2)
+                self.values = mx.concatenate([self.values, new_v], axis=2)
+            else:
+                self.keys, self.values = new_k, new_v
+
+        self.offset += S
+        if S > 0:
+            self.keys[..., prev : self.offset, :] = keys
+            self.values[..., prev : self.offset, :] = values
+        return (
+            self.keys[..., : self.offset, :],
+            self.values[..., : self.offset, :],
+        )
+
+    def size(self):
+        return self.offset
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        if self.offset == self.keys.shape[2]:
+            return self.keys, self.values
+        return (
+            self.keys[..., : self.offset, :],
+            self.values[..., : self.offset, :],
+        )
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
+
+    @property
+    def meta_state(self):
+        return (str(self.offset),)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        (offset_str,) = v
+        self.offset = int(offset_str)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        # V4Attention builds its own combined (window + compressed) mask; the
+        # compressed sub-cache does not participate in the top-level dispatch.
+        return None
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+
+class HybridV4Cache(_BaseCache):
+    """Composite cache for a compressed DeepSeek-V4 attention layer.
+
+    Holds a rotating window KV cache (last `window_size` raw tokens) plus a
+    compressed KV cache (gated-pooled rows accumulated every `ratio` tokens).
+    V4Attention pulls window KV and compressed KV separately and builds its
+    own sparse-attention mask, so this wrapper just plumbs state and mask
+    delegation for the sliding portion.
+    """
+
+    def __init__(self, window_size):
+        self.window = RotatingKVCache(max_size=window_size)
+        self.compressed = CompressedKVCache()
+
+    @property
+    def offset(self):
+        return self.window.offset
+
+    def size(self):
+        return self.window.size()
+
+    def empty(self):
+        return self.window.empty() and self.compressed.empty()
+
+    def is_trimmable(self):
+        return self.window.is_trimmable()
+
+    def trim(self, n):
+        return self.window.trim(n)
+
+    def make_mask(self, *args, **kwargs):
+        return self.window.make_mask(*args, **kwargs)
+
+    @property
+    def state(self):
+        return self.window.state, self.compressed.state
+
+    @state.setter
+    def state(self, v):
+        window_state, compressed_state = v
+        self.window = RotatingKVCache.__new__(RotatingKVCache)
+        self.compressed = CompressedKVCache.__new__(CompressedKVCache)
+        self.window.state = window_state
+        self.compressed.state = compressed_state
+
+    @property
+    def meta_state(self):
+        return self.window.meta_state, self.compressed.meta_state
+
+    @meta_state.setter
+    def meta_state(self, v):
+        window_meta, compressed_meta = v
+        self.window.meta_state = window_meta
+        self.compressed.meta_state = compressed_meta
+
+    @property
+    def nbytes(self):
+        return self.window.nbytes + self.compressed.nbytes
+
+
 class RotatingKVCache(_BaseCache):
     step = 256
 

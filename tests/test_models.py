@@ -1538,8 +1538,9 @@ class TestModels(unittest.TestCase):
             self.assertEqual(outputs.dtype, dtype)
 
             cache = model.make_cache()
+            from mlx_lm.models.cache import HybridV4Cache
             self.assertIsInstance(cache[0], RotatingKVCache)
-            self.assertIsInstance(cache[2], KVCache)
+            self.assertIsInstance(cache[2], HybridV4Cache)
             outputs = model(inputs[:, :3], cache=cache)
             self.assertEqual(outputs.shape, (1, 3, args.vocab_size))
             self.assertEqual(outputs.dtype, dtype)
@@ -1594,10 +1595,11 @@ class TestModels(unittest.TestCase):
             layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
 
         cache = model.make_cache()
+        from mlx_lm.models.cache import HybridV4Cache
         self.assertIsInstance(cache[0], RotatingKVCache)
-        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[1], HybridV4Cache)
         self.assertIsInstance(cache[2], RotatingKVCache)
-        self.assertIsInstance(cache[3], KVCache)
+        self.assertIsInstance(cache[3], HybridV4Cache)
 
         # Prefill past sliding_window so the two cache types diverge in length.
         prefill = mx.arange(12, dtype=mx.int32)[None, :]
@@ -1608,6 +1610,123 @@ class TestModels(unittest.TestCase):
         next_chunk = mx.array([[100, 101, 102, 103]], dtype=mx.int32)
         outputs = model(next_chunk, cache=cache)
         self.assertEqual(outputs.shape, (1, 4, args.vocab_size))
+
+    def test_deepseek_v4_make_cache_hybrid(self):
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.cache import (
+            HybridV4Cache, RotatingKVCache, CompressedKVCache,
+        )
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 128, 0, 128],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=512,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 256,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        cache = model.make_cache()
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], HybridV4Cache)
+        self.assertIsInstance(cache[2], RotatingKVCache)
+        self.assertIsInstance(cache[3], HybridV4Cache)
+        # Hybrid layer's sub-caches must also be the right types.
+        self.assertIsInstance(cache[1].window, RotatingKVCache)
+        self.assertIsInstance(cache[1].compressed, CompressedKVCache)
+        self.assertEqual(cache[1].window.max_size, args.sliding_window)
+
+    def test_deepseek_v4_ratio128_multi_turn_forward(self):
+        # End-to-end forward: prefill + streamed decode through a hybrid
+        # (ratio=0 / ratio=128) stack. Emission happens once compressed
+        # history reaches 128 tokens; test uses prefill=256 to guarantee
+        # at least two compressed rows are emitted and attended to.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[0, 128, 0, 128],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=512,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 256,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        for layer in model.model.layers:
+            layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+        cache = model.make_cache()
+
+        # Prefill 256 tokens. Compressed layers should emit 256/128 = 2 rows.
+        prefill = mx.arange(256, dtype=mx.int32)[None, :]
+        out = model(prefill, cache=cache)
+        self.assertEqual(out.shape, (1, 256, args.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(out)).item())
+        # Compressed sub-caches should have 2 rows each for ratio=128 layers.
+        for i, layer in enumerate(model.model.layers):
+            if layer.attn.compress_ratio:
+                self.assertEqual(cache[i].compressed.offset, 2,
+                                 f"layer {i} expected 2 compressed rows")
+
+        # Streamed decode: 8 tokens, one at a time.
+        for step in range(8):
+            token = mx.array([[256 + step]], dtype=mx.int32)
+            out = model(token, cache=cache)
+            self.assertEqual(out.shape, (1, 1, args.vocab_size))
+            self.assertTrue(
+                mx.all(mx.isfinite(out)).item(),
+                f"non-finite output at decode step {step}",
+            )
 
     def test_deepseek_v4_compressor_prefill_decode_parity_ratio4(self):
         # Ratio=4 with overlap: prefill one shot vs token-by-token decode must

@@ -17,7 +17,12 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, RotatingKVCache
+from .cache import (
+    CompressedKVCache,
+    HybridV4Cache,
+    KVCache,
+    RotatingKVCache,
+)
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
@@ -236,15 +241,17 @@ def _make_sinkhorn_kernel(hc: int, iters: int, eps: float):
     iter_body = "\n".join([row_norm(), col_norm()])
     inner_iters = "\n".join([iter_body] * (iters - 1))
 
+    # Direct indexing into the input/output buffers avoids declaring Metal
+    # intermediate pointers; MLX decides the address space of `comb_log` at
+    # runtime (constant vs. device) based on buffer size, and a pointer
+    # declaration with a hard-coded address space mismatches smaller shapes.
     source = f"""
         uint n = thread_position_in_grid.x;
         if (n >= n_tokens[0]) return;
 
-        const device float *src = comb_log + n * {n_elem};
-        device float *dst = comb + n * {n_elem};
-
+        uint base = n * {n_elem};
         float m[{n_elem}];
-{chr(10).join(f"        m[{i}] = src[{i}];" for i in range(n_elem))}
+{chr(10).join(f"        m[{i}] = comb_log[base + {i}];" for i in range(n_elem))}
 
         // Row softmax
 {row_softmax()}
@@ -258,7 +265,7 @@ def _make_sinkhorn_kernel(hc: int, iters: int, eps: float):
         // Remaining (iters - 1) rounds of (row_norm, col_norm)
 {inner_iters}
 
-{chr(10).join(f"        dst[{i}] = m[{i}];" for i in range(n_elem))}
+{chr(10).join(f"        comb[base + {i}] = m[{i}];" for i in range(n_elem))}
     """
 
     kernel = mx.fast.metal_kernel(
@@ -854,46 +861,103 @@ class V4Attention(nn.Module):
         # --- Q ---
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        # RMS-normalize each head independently (matches ref: q *= rsqrt(mean(q^2)+eps))
         q = q * mx.rsqrt(q.square().mean(axis=-1, keepdims=True) + self.eps)
 
         # --- K = V (shared single-head) ---
         kv = self.kv_norm(self.wkv(x))
-        kv = kv.reshape(B, S, 1, self.head_dim).transpose(0, 2, 1, 3)   # [B, 1, S, head_dim]
+        kv = kv.reshape(B, S, 1, self.head_dim).transpose(0, 2, 1, 3)
 
         offset = cache.offset if cache is not None else 0
 
-        # Apply RoPE only to the last rope_head_dim dims
-        q_nope, q_pe = mx.split(q,  [self.nope_head_dim], axis=-1)
+        q_nope, q_pe = mx.split(q, [self.nope_head_dim], axis=-1)
         k_nope, k_pe = mx.split(kv, [self.nope_head_dim], axis=-1)
         q_pe = self.rope(q_pe, offset=offset)
         k_pe = self.rope(k_pe, offset=offset)
         q = mx.concatenate([q_nope, q_pe], axis=-1)
         k = v = mx.concatenate([k_nope, k_pe], axis=-1)
 
-        # Update KV cache
-        if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
-
-        # Standard SDPA (compressed KV + topk deferred to v0.2)
-        out = scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
-        )
+        if not self.compress_ratio:
+            # Pure sliding-window layer (ratio=0). Unchanged from the original
+            # path — uses the layer's RotatingKVCache and the outer mask.
+            if cache is not None:
+                k, v = cache.update_and_fetch(k, v)
+            out = scaled_dot_product_attention(
+                q, k, v,
+                cache=cache, scale=self.scale, mask=mask,
+                sinks=self.attn_sink.astype(q.dtype),
+            )
+        else:
+            # Compressed-attention layer. cache is a HybridV4Cache: one
+            # RotatingKVCache for the last sliding_window raw tokens, one
+            # CompressedKVCache for gated-pooled rows emitted every `ratio`
+            # tokens. Build the combined key set + a causal mask that respects
+            # each key's absolute token position. Phase-3 attends to all
+            # compressed rows (no Indexer top-k — that's Phase 4/5).
+            out = self._compressed_attention(q, k, v, x, offset, S, B, cache)
 
         out_nope, out_pe = mx.split(out, [self.nope_head_dim], axis=-1)
         out_pe = self.rope(out_pe, offset=offset, inverse=True)
         out = mx.concatenate([out_nope, out_pe], axis=-1)
 
-        # Grouped low-rank projection: [B, n_heads, S, head_dim] -> [B, S, n_heads*head_dim]
         out = out.transpose(0, 2, 1, 3).reshape(B, S, self.n_heads * self.head_dim)
         out = self._grouped_output_projection(out)
         return self.wo_b(out)
+
+    def _compressed_attention(self, q, k, v, x, offset, S, B, cache):
+        # Allow cache-less forward (used by some smoke tests): build a throw-
+        # away hybrid cache so the rest of the path is uniform.
+        if cache is None:
+            cache = HybridV4Cache(window_size=self.window)
+        # Update window cache (returns keys possibly in ring-buffer order once
+        # the rotating cache starts trimming; _temporal_order canonicalizes).
+        win_k, win_v = cache.window.update_and_fetch(k, v)
+        win_k = cache.window._temporal_order(win_k)
+        win_v = cache.window._temporal_order(win_v)
+
+        # Run Compressor on the raw hidden state. Emits 0+ compressed rows.
+        compressed_new = self.compressor(x, start_pos=offset)
+        if compressed_new is not None:
+            comp_kv = compressed_new[:, None, :, :]  # add head dim
+            cache.compressed.update_and_fetch(comp_kv, comp_kv)
+
+        ncomp = cache.compressed.offset
+        if ncomp > 0:
+            comp_k = cache.compressed.keys[..., :ncomp, :].astype(win_k.dtype)
+            comp_v = cache.compressed.values[..., :ncomp, :].astype(win_v.dtype)
+            combined_k = mx.concatenate([win_k, comp_k], axis=-2)
+            combined_v = mx.concatenate([win_v, comp_v], axis=-2)
+        else:
+            combined_k = win_k
+            combined_v = win_v
+
+        # Causal mask over (window + compressed) for each of S queries.
+        # Query qi's absolute position = offset + qi. Window key wi (temporal)
+        # represents absolute position offset_new - win_len + wi, where
+        # offset_new = offset + S. Allowed iff win_key_pos <= qi_pos.
+        offset_new = offset + S
+        win_len = win_k.shape[-2]
+        r = self.compress_ratio
+        qi = mx.arange(S)[:, None]
+        wi = mx.arange(win_len)[None, :]
+        # offset_new - win_len + wi <= offset + qi  <=>  wi <= win_len - S + qi
+        win_mask = wi <= (win_len - S + qi)
+        if ncomp > 0:
+            ji = mx.arange(ncomp)[None, :]
+            # compressed row j covers tokens [j*r, (j+1)*r). It is fully
+            # formed at absolute position (j+1)*r - 1. Allowed iff that
+            # position <= query's absolute position (offset + qi).
+            comp_mask = ((ji + 1) * r - 1) <= (offset + qi)
+            combined_mask = mx.concatenate([win_mask, comp_mask], axis=-1)
+        else:
+            combined_mask = win_mask
+
+        return scaled_dot_product_attention(
+            q, combined_k, combined_v,
+            cache=None,
+            scale=self.scale,
+            mask=combined_mask,
+            sinks=self.attn_sink.astype(q.dtype),
+        )
 
 
 class Indexer(nn.Module):
@@ -1070,10 +1134,10 @@ class Model(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.attn.compress_ratio:
-                # Full cache for compressed-attention layers (MVP: no topk selection)
-                caches.append(KVCache())
+                # Compressed-attention layers: window (last sliding_window raw
+                # tokens) + compressed KV rows emitted every `ratio` tokens.
+                caches.append(HybridV4Cache(window_size=self.args.sliding_window))
             else:
-                # Sliding-window cache for pure local-attention layers
                 caches.append(RotatingKVCache(max_size=self.args.sliding_window))
         return caches
 

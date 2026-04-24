@@ -961,20 +961,136 @@ class V4Attention(nn.Module):
 
 
 class Indexer(nn.Module):
-    """Top-k selector over compressed KV rows. For MVP we instantiate to preserve
-    checkpoint parameter names; the actual topk gather path is not yet used in
-    the forward pass (we attend to all compressed rows in v0.1)."""
+    """Top-k selector over compressed KV rows for ratio=4 layers.
+
+    Has its own Compressor (separate weights from the Attention's main
+    Compressor) that maintains an independent compressed KV buffer used for
+    scoring. Returns per-query top-k indices into the combined (window +
+    compressed) key buffer — callers add `offset` so indices land in the
+    compressed region.
+
+    Mirrors /tmp/dsv4-ref/model.py:380-433. Skips the Hadamard rotation
+    and FP4 activation quantization of the reference (optimizations).
+    """
 
     def __init__(self, args: ModelArgs, compress_ratio: int):
         super().__init__()
         self.dim = args.hidden_size
         self.n_heads = args.index_n_heads
         self.head_dim = args.index_head_dim
+        self.rope_head_dim = args.qk_rope_head_dim
+        self.nope_head_dim = self.head_dim - args.qk_rope_head_dim
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
+        self.compress_ratio = compress_ratio
+        self.softmax_scale = self.head_dim ** -0.5
+
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.compressor = Compressor(args, compress_ratio, self.head_dim)
+        self.rope = DeepseekV4RoPE(
+            args.qk_rope_head_dim,
+            args.compress_rope_theta,
+            getattr(args, "rope_scaling", None),
+        )
+
+        # Indexer's own compressed KV buffer (separate from the attention's
+        # HybridV4Cache.compressed). Keyed in a dict so MLX nn.Module does
+        # not auto-register it as a parameter.
+        self._kv_rows = {"tensor": None}
+
+    def reset_rows(self):
+        self._kv_rows["tensor"] = None
+        self.compressor.reset_state(1)
+
+    def __call__(
+        self,
+        x: mx.array,
+        qr: mx.array,
+        start_pos: int,
+        offset: int,
+    ) -> mx.array:
+        B, S, _ = x.shape
+        r = self.compress_ratio
+
+        # Fresh conversation: clear state so prior turns don't leak in.
+        if start_pos == 0:
+            self._kv_rows["tensor"] = None
+            self.compressor.reset_state(B)
+
+        # Update Indexer's own compressed KV stream.
+        comp_new = self.compressor(x, start_pos=start_pos)
+        if comp_new is not None:
+            if self._kv_rows["tensor"] is None:
+                self._kv_rows["tensor"] = comp_new
+            else:
+                self._kv_rows["tensor"] = mx.concatenate(
+                    [self._kv_rows["tensor"], comp_new], axis=1
+                )
+
+        # Short-circuit when nothing to select from: return all-invalid pad.
+        kv_cache = self._kv_rows["tensor"]
+        if kv_cache is None or kv_cache.shape[1] == 0:
+            return mx.full((B, S, self.index_topk), -1, dtype=mx.int32)
+
+        # Q path: project, reshape, apply RoPE to the last rope_head_dim dims.
+        q = (
+            self.wq_b(qr)
+            .reshape(B, S, self.n_heads, self.head_dim)
+            .transpose(0, 2, 1, 3)  # [B, H, S, head_dim]
+        )
+        q_nope, q_pe = mx.split(q, [self.nope_head_dim], axis=-1)
+        q_pe = self.rope(q_pe, offset=start_pos)
+        q = mx.concatenate([q_nope, q_pe], axis=-1)
+
+        # Number of compressed rows "live" at query's current absolute pos.
+        end_pos = start_pos + S
+        n_live = min(kv_cache.shape[1], end_pos // r if end_pos >= r else 0)
+        if n_live == 0:
+            return mx.full((B, S, self.index_topk), -1, dtype=mx.int32)
+        kv_live = kv_cache[:, :n_live, :].astype(q.dtype)  # [B, N, head_dim]
+
+        weights = self.weights_proj(x) * (
+            self.softmax_scale * self.n_heads ** -0.5
+        )  # [B, S, H]
+        weights = weights.transpose(0, 2, 1)  # [B, H, S]
+
+        # scores[b, h, s, t] = <q[b, h, s], kv_live[b, t]>
+        scores = mx.einsum("bhsd,btd->bhst", q, kv_live)
+        scores = mx.maximum(scores, 0.0) * weights[..., None]  # relu * head weight
+        scores = scores.sum(axis=1)  # reduce heads -> [B, S, N]
+
+        # Causality (prefill only): query at token (start_pos + qi) can see
+        # compressed row j iff (j+1)*r - 1 <= start_pos + qi.
+        if start_pos == 0:
+            qi = mx.arange(1, S + 1)[:, None]  # [S, 1]
+            ji = mx.arange(n_live)[None, :]  # [1, N]
+            invalid = ji >= (qi // r)
+            scores = mx.where(invalid, mx.array(float("-inf"), scores.dtype), scores)
+
+        k_eff = min(self.index_topk, n_live)
+        if k_eff < n_live:
+            topk = mx.argpartition(-scores, kth=k_eff - 1, axis=-1)[..., :k_eff]
+        else:
+            topk = mx.argsort(-scores, axis=-1)[..., :k_eff]
+        topk = topk.astype(mx.int32)
+
+        # Re-mask causality-violating selections as -1; shift by offset so
+        # indices point into the compressed region of the combined buffer.
+        if start_pos == 0:
+            qi = mx.arange(1, S + 1)[:, None]
+            invalid = topk >= (qi // r).astype(mx.int32)
+            topk = mx.where(invalid, mx.array(-1, dtype=mx.int32), topk + offset)
+        else:
+            topk = topk + offset
+
+        # Pad to index_topk so callers can rely on a fixed trailing dim.
+        if k_eff < self.index_topk:
+            pad = mx.full(
+                (B, S, self.index_topk - k_eff), -1, dtype=mx.int32
+            )
+            topk = mx.concatenate([topk, pad], axis=-1)
+        return topk
 
 
 # --------------------------------------------------------------------------- #

@@ -1611,6 +1611,122 @@ class TestModels(unittest.TestCase):
         outputs = model(next_chunk, cache=cache)
         self.assertEqual(outputs.shape, (1, 4, args.vocab_size))
 
+    def _tiny_v4_args(self):
+        # Shared tiny model config for Indexer unit tests. ratio=4 and
+        # index_head_dim small so the math is cheap.
+        from mlx_lm.models import deepseek_v4
+        return deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=32,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[4],
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=0,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=128,
+            compress_rope_theta=160000.0,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 64,
+                "type": "yarn",
+            },
+        )
+
+    def test_deepseek_v4_indexer_shape_and_dtype(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = self._tiny_v4_args()
+        mx.random.seed(5)
+        indexer = deepseek_v4.Indexer(args, compress_ratio=4)
+        indexer.compressor.ape = mx.random.normal(
+            (4, 2 * args.index_head_dim), dtype=mx.float32
+        )
+        mx.eval(indexer.parameters())
+
+        B, S = 1, 16
+        x = mx.random.normal((B, S, args.hidden_size), dtype=mx.float32)
+        qr = mx.random.normal((B, S, args.q_lora_rank), dtype=mx.float32)
+
+        topk = indexer(x, qr, start_pos=0, offset=0)
+        self.assertEqual(topk.shape, (B, S, args.index_topk))
+        self.assertEqual(topk.dtype, mx.int32)
+
+    def test_deepseek_v4_indexer_causality(self):
+        # Prefill S=20 tokens, ratio=4 => up to 5 compressed rows. For each
+        # query qi, every non-(-1) top-k entry must point to a compressed row
+        # fully formed by token qi, i.e. (j+1)*4 - 1 <= qi  <=>  j < (qi+1)/4.
+        from mlx_lm.models import deepseek_v4
+
+        args = self._tiny_v4_args()
+        mx.random.seed(7)
+        indexer = deepseek_v4.Indexer(args, compress_ratio=4)
+        indexer.compressor.ape = mx.random.normal(
+            (4, 2 * args.index_head_dim), dtype=mx.float32
+        )
+        mx.eval(indexer.parameters())
+
+        B, S = 1, 20
+        x = mx.random.normal((B, S, args.hidden_size), dtype=mx.float32)
+        qr = mx.random.normal((B, S, args.q_lora_rank), dtype=mx.float32)
+
+        offset = 100  # arbitrary non-zero offset to exercise the index shift
+        topk = indexer(x, qr, start_pos=0, offset=offset)
+
+        # Convert to numpy for simple per-row inspection.
+        topk_np = topk.tolist()[0]  # [S][K]
+        for qi, row in enumerate(topk_np):
+            max_valid_j = (qi + 1) // 4 - 1  # row j allowed iff j <= max_valid_j
+            for val in row:
+                if val == -1:
+                    continue
+                # Selected index is offset + j ; recover j
+                j = val - offset
+                self.assertGreaterEqual(
+                    j, 0, f"qi={qi}: j={j} is negative (offset subtract wrong)"
+                )
+                self.assertLessEqual(
+                    j, max_valid_j,
+                    f"qi={qi}: selected j={j} violates causality "
+                    f"(max allowed j={max_valid_j})",
+                )
+
+    def test_deepseek_v4_indexer_determinism(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = self._tiny_v4_args()
+        mx.random.seed(9)
+        indexer = deepseek_v4.Indexer(args, compress_ratio=4)
+        indexer.compressor.ape = mx.random.normal(
+            (4, 2 * args.index_head_dim), dtype=mx.float32
+        )
+        mx.eval(indexer.parameters())
+
+        B, S = 1, 12
+        x = mx.random.normal((B, S, args.hidden_size), dtype=mx.float32)
+        qr = mx.random.normal((B, S, args.q_lora_rank), dtype=mx.float32)
+
+        topk_a = indexer(x, qr, start_pos=0, offset=0)
+        topk_b = indexer(x, qr, start_pos=0, offset=0)
+        self.assertTrue(mx.array_equal(topk_a, topk_b))
+
     def test_deepseek_v4_make_cache_hybrid(self):
         from mlx_lm.models import deepseek_v4
         from mlx_lm.models.cache import (

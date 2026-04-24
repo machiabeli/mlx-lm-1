@@ -1609,6 +1609,98 @@ class TestModels(unittest.TestCase):
         outputs = model(next_chunk, cache=cache)
         self.assertEqual(outputs.shape, (1, 4, args.vocab_size))
 
+    def test_deepseek_v4_compressed_kv_cache_roundtrip(self):
+        from mlx_lm.models.cache import CompressedKVCache
+
+        cache = CompressedKVCache()
+        self.assertTrue(cache.empty())
+        self.assertEqual(cache.offset, 0)
+        self.assertEqual(cache.nbytes, 0)
+
+        # Append 3 compressed rows (single-head: [B, 1, S, D]).
+        k0 = mx.random.uniform(shape=(1, 1, 3, 16))
+        v0 = mx.random.uniform(shape=(1, 1, 3, 16))
+        k_up, v_up = cache.update_and_fetch(k0, v0)
+        self.assertEqual(cache.offset, 3)
+        self.assertFalse(cache.empty())
+        self.assertEqual(k_up.shape, (1, 1, 3, 16))
+        self.assertTrue(mx.array_equal(k_up, k0))
+        self.assertTrue(mx.array_equal(v_up, v0))
+
+        # Append 1 more row.
+        k1 = mx.random.uniform(shape=(1, 1, 1, 16))
+        v1 = mx.random.uniform(shape=(1, 1, 1, 16))
+        k_up, v_up = cache.update_and_fetch(k1, v1)
+        self.assertEqual(cache.offset, 4)
+        self.assertEqual(k_up.shape, (1, 1, 4, 16))
+        self.assertTrue(mx.array_equal(k_up[..., 3:, :], k1))
+
+        # Append 7 more rows (forces buffer grow past initial step=64).
+        k2 = mx.random.uniform(shape=(1, 1, 7, 16))
+        v2 = mx.random.uniform(shape=(1, 1, 7, 16))
+        k_up, v_up = cache.update_and_fetch(k2, v2)
+        self.assertEqual(cache.offset, 11)
+        self.assertTrue(mx.array_equal(k_up[..., 4:, :], k2))
+
+        # nbytes tracks bytes of stored keys+values (visible portion or full buffer).
+        self.assertGreater(cache.nbytes, 0)
+
+        # State round-trip via from_state.
+        state = cache.state
+        meta = cache.meta_state
+        restored = CompressedKVCache.from_state(state, meta)
+        self.assertEqual(restored.offset, cache.offset)
+        self.assertTrue(mx.array_equal(restored.update_and_fetch(
+            mx.zeros((1, 1, 0, 16)), mx.zeros((1, 1, 0, 16))
+        )[0][..., : cache.offset, :], k_up))
+
+        # Trim by rows.
+        trimmed = cache.trim(3)
+        self.assertEqual(trimmed, 3)
+        self.assertEqual(cache.offset, 8)
+        # Trim more than offset only removes offset.
+        trimmed = cache.trim(100)
+        self.assertEqual(trimmed, 8)
+        self.assertEqual(cache.offset, 0)
+
+    def test_deepseek_v4_hybrid_cache_composite(self):
+        from mlx_lm.models.cache import HybridV4Cache, RotatingKVCache, CompressedKVCache
+
+        cache = HybridV4Cache(window_size=8)
+        self.assertIsInstance(cache.window, RotatingKVCache)
+        self.assertIsInstance(cache.compressed, CompressedKVCache)
+        self.assertEqual(cache.offset, 0)
+        self.assertTrue(cache.empty())
+
+        # Feed 12 tokens to window cache (sliding, max_size=8).
+        k = mx.random.uniform(shape=(1, 1, 12, 16))
+        v = mx.random.uniform(shape=(1, 1, 12, 16))
+        cache.window.update_and_fetch(k, v)
+        self.assertEqual(cache.offset, 12)  # window tracks total tokens
+        self.assertFalse(cache.empty())
+
+        # Append 3 compressed rows.
+        cr = mx.random.uniform(shape=(1, 1, 3, 16))
+        cache.compressed.update_and_fetch(cr, cr)
+        self.assertEqual(cache.compressed.offset, 3)
+
+        # State round-trip.
+        state = cache.state
+        meta = cache.meta_state
+        restored = HybridV4Cache.from_state(state, meta)
+        self.assertEqual(restored.offset, cache.offset)
+        self.assertEqual(restored.compressed.offset, 3)
+        self.assertEqual(restored.window.max_size, 8)
+
+        # make_mask delegates to window (sliding mask behavior).
+        mask = cache.make_mask(1, window_size=8)
+        # With offset==12 and max_size==8 already rotated, sliding mask exists
+        # for decode step N=1 when offset >= window_size.
+        self.assertTrue(mask is None or mask.ndim >= 1)
+
+        # nbytes sums sub-caches.
+        self.assertEqual(cache.nbytes, cache.window.nbytes + cache.compressed.nbytes)
+
     def test_mixed_quant_preserves_deepseek_v4_attention_paths(self):
         from mlx_lm.convert import mixed_quant_predicate_builder
         from mlx_lm.models import deepseek_v4

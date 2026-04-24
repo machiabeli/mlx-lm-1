@@ -547,9 +547,13 @@ class DeepseekV4MoE(nn.Module):
 class Compressor(nn.Module):
     """Learned gated pooling over `ratio` consecutive tokens for KV compression.
 
-    At prefill, produces ~ seq/ratio compressed KV rows. At decode, accumulates
-    tokens in a state buffer and emits a compressed row every `ratio` steps.
-    Pure-MLX; a fused Metal kernel may replace this in a follow-up.
+    Prefill emits S // ratio compressed rows in one shot; decode accumulates
+    tokens in an internal state buffer and emits one compressed row every
+    `ratio` steps. RMS-norm and RoPE (at strided positions for prefill, at the
+    window start for decode) are applied to the pooled output before return.
+
+    Mirrors /tmp/dsv4-ref/model.py:279-377 semantics. Skips Hadamard rotation
+    and FP4/FP8 activation quantization (optimizations, not correctness).
     """
 
     def __init__(self, args: ModelArgs, compress_ratio: int, head_dim: int):
@@ -557,13 +561,33 @@ class Compressor(nn.Module):
         self.dim = args.hidden_size
         self.head_dim = head_dim
         self.rope_head_dim = args.qk_rope_head_dim
+        self.nope_head_dim = head_dim - args.qk_rope_head_dim
         self.ratio = compress_ratio
         self.overlap = compress_ratio == 4
-        out_dim = head_dim * (2 if self.overlap else 1)
+        self.coff = 2 if self.overlap else 1
+        self.eps = args.rms_norm_eps
+
+        out_dim = head_dim * self.coff
         self.wkv = nn.Linear(self.dim, out_dim, bias=False)
         self.wgate = nn.Linear(self.dim, out_dim, bias=False)
         self.ape = mx.zeros((compress_ratio, out_dim), dtype=mx.float32)
-        self.norm  = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.rope = DeepseekV4RoPE(
+            args.qk_rope_head_dim,
+            args.compress_rope_theta,
+            getattr(args, "rope_scaling", None),
+        )
+
+        # Decode-phase state lives in a dict to keep it out of MLX nn.Module's
+        # parameter registration (it's transient, not a learnable parameter).
+        self._decode_state = {}
+
+    def reset_state(self, batch_size: int):
+        buf_shape = (batch_size, self.coff * self.ratio, self.coff * self.head_dim)
+        self._decode_state["kv"] = mx.zeros(buf_shape, dtype=mx.float32)
+        self._decode_state["score"] = mx.full(
+            buf_shape, float("-inf"), dtype=mx.float32
+        )
 
     def _overlap_transform(self, tensor: mx.array, value: float) -> mx.array:
         B, S, R, _ = tensor.shape
@@ -573,24 +597,139 @@ class Compressor(nn.Module):
         out[:, 1:, :R] = tensor[:, :-1, :, :D]
         return out
 
-    def __call__(self, x: mx.array) -> mx.array:
-        # Prefill-only MVP: chunk x into windows of `ratio` tokens. Ratio-4
-        # layers use the overlapping layout from the reference implementation.
-        # Returns compressed KV: [B, S//ratio, head_dim] (bf16).
+    def _apply_rope_to_rows(self, rows: mx.array, positions) -> mx.array:
+        """rows: [B, N, head_dim]. Apply RoPE to last rope_head_dim dims at the
+        given list of integer positions (one per row). Non-rope prefix is
+        passed through unchanged."""
+        if self.rope_head_dim == 0 or rows.shape[1] == 0:
+            return rows
+        nope = rows[..., : self.nope_head_dim]
+        pe = rows[..., self.nope_head_dim :]
+        rotated = []
+        for i in range(rows.shape[1]):
+            rotated.append(self.rope(pe[:, i : i + 1, :], offset=int(positions[i])))
+        pe_out = mx.concatenate(rotated, axis=1)
+        return mx.concatenate([nope, pe_out], axis=-1)
+
+    def __call__(self, x: mx.array, start_pos: int = 0):
+        B, S, _ = x.shape
+        if (
+            "kv" not in self._decode_state
+            or self._decode_state["kv"].shape[0] < B
+        ):
+            self.reset_state(B)
+
+        if start_pos == 0:
+            return self._prefill(x)
+
+        # Non-zero start_pos: iterate decode steps. mlx_lm decode-loop is
+        # usually S==1, but multi-turn chat prefill lands here with S>1.
+        emitted = []
+        for i in range(S):
+            row = self._decode_step(x[:, i : i + 1, :], start_pos + i)
+            if row is not None:
+                emitted.append(row)
+        if emitted:
+            return mx.concatenate(emitted, axis=1)
+        return None
+
+    def _prefill(self, x: mx.array):
+        # /tmp/dsv4-ref/model.py:325-342, 362-374.
         B, S, _ = x.shape
         r = self.ratio
-        keep = (S // r) * r
-        if keep == 0:
-            return mx.zeros((B, 0, self.head_dim), dtype=x.dtype)
-        xf = x[:, :keep].astype(mx.float32)
-        kv = self.wkv(xf).reshape(B, keep // r, r, -1)
-        score = self.wgate(xf).reshape(B, keep // r, r, -1) + self.ape
+        d = self.head_dim
+        coff = self.coff
+        in_dtype = x.dtype
+
+        xf = x.astype(mx.float32)
+        kv = self.wkv(xf)
+        score = self.wgate(xf)
+
+        should_compress = S >= r
+        remainder = S % r
+        cutoff = S - remainder
+        offset = r if self.overlap else 0
+
+        # Seed decode state so a subsequent token-by-token call continues the
+        # compression stream without discontinuity.
+        if self.overlap and cutoff >= r:
+            self._decode_state["kv"][:B, :r] = kv[:, cutoff - r : cutoff]
+            self._decode_state["score"][:B, :r] = (
+                score[:, cutoff - r : cutoff] + self.ape
+            )
+        if remainder > 0:
+            self._decode_state["kv"][:B, offset : offset + remainder] = kv[:, cutoff:]
+            self._decode_state["score"][:B, offset : offset + remainder] = (
+                score[:, cutoff:] + self.ape[:remainder]
+            )
+            kv = kv[:, :cutoff]
+            score = score[:, :cutoff]
+
+        if not should_compress:
+            return None
+
+        kv_chunk = kv.reshape(B, cutoff // r, r, coff * d)
+        score_chunk = score.reshape(B, cutoff // r, r, coff * d) + self.ape
         if self.overlap:
-            kv = self._overlap_transform(kv, 0.0)
-            score = self._overlap_transform(score, float("-inf"))
-        weights = mx.softmax(score, axis=2, precise=True)
-        kv = (kv * weights).sum(axis=2)
-        return self.norm(kv.astype(x.dtype))
+            kv_chunk = self._overlap_transform(kv_chunk, 0.0)
+            score_chunk = self._overlap_transform(score_chunk, float("-inf"))
+        weights = mx.softmax(score_chunk, axis=2, precise=True)
+        pooled = (kv_chunk * weights).sum(axis=2)
+
+        pooled = self.norm(pooled.astype(in_dtype))
+        positions = [i * r for i in range(pooled.shape[1])]
+        pooled = self._apply_rope_to_rows(pooled, positions)
+        return pooled
+
+    def _decode_step(self, x: mx.array, start_pos: int):
+        # /tmp/dsv4-ref/model.py:343-360, 362-366.
+        B = x.shape[0]
+        r = self.ratio
+        d = self.head_dim
+        in_dtype = x.dtype
+
+        xf = x.astype(mx.float32)
+        kv_t = self.wkv(xf).reshape(B, -1)
+        score_t = (self.wgate(xf) + self.ape[start_pos % r][None, None, :]).reshape(
+            B, -1
+        )
+
+        should_compress = (start_pos + 1) % r == 0
+
+        if self.overlap:
+            slot = r + (start_pos % r)
+            self._decode_state["kv"][:B, slot] = kv_t
+            self._decode_state["score"][:B, slot] = score_t
+            if not should_compress:
+                return None
+            kv_state = self._decode_state["kv"][:B]
+            score_state = self._decode_state["score"][:B]
+            kv_cat = mx.concatenate(
+                [kv_state[:, :r, :d], kv_state[:, r:, d:]], axis=1
+            )
+            score_cat = mx.concatenate(
+                [score_state[:, :r, :d], score_state[:, r:, d:]], axis=1
+            )
+            weights = mx.softmax(score_cat, axis=1, precise=True)
+            pooled = (kv_cat * weights).sum(axis=1, keepdims=True)
+            # Rotate the overlap half forward for the next window.
+            self._decode_state["kv"][:B, :r] = self._decode_state["kv"][:B, r:]
+            self._decode_state["score"][:B, :r] = self._decode_state["score"][:B, r:]
+        else:
+            slot = start_pos % r
+            self._decode_state["kv"][:B, slot] = kv_t
+            self._decode_state["score"][:B, slot] = score_t
+            if not should_compress:
+                return None
+            kv_state = self._decode_state["kv"][:B]
+            score_state = self._decode_state["score"][:B]
+            weights = mx.softmax(score_state, axis=1, precise=True)
+            pooled = (kv_state * weights).sum(axis=1, keepdims=True)
+
+        pooled = self.norm(pooled.astype(in_dtype))
+        positions = [start_pos + 1 - r]
+        pooled = self._apply_rope_to_rows(pooled, positions)
+        return pooled
 
 
 class V4Attention(nn.Module):

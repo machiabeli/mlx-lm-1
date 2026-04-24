@@ -1609,6 +1609,126 @@ class TestModels(unittest.TestCase):
         outputs = model(next_chunk, cache=cache)
         self.assertEqual(outputs.shape, (1, 4, args.vocab_size))
 
+    def test_deepseek_v4_compressor_prefill_decode_parity_ratio4(self):
+        # Ratio=4 with overlap: prefill one shot vs token-by-token decode must
+        # produce identical compressed rows (within fp32 tolerance), because
+        # the decode-phase state machine is designed to mirror what prefill
+        # computes with overlap_transform. Mirrors reference model.py:316-377.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=32,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[4],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=0,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=128,
+            compress_rope_theta=160000.0,
+        )
+        mx.random.seed(0)
+        compressor = deepseek_v4.Compressor(args, compress_ratio=4, head_dim=args.head_dim)
+        # Randomize weights deterministically (default init is zeros for ape,
+        # nn.Linear is already random-init'd).
+        compressor.ape = mx.random.normal((4, 2 * args.head_dim), dtype=mx.float32)
+        mx.eval(compressor.parameters())
+
+        # 16 tokens => 4 compressed rows.
+        x = mx.random.normal((1, 16, args.hidden_size), dtype=mx.float32)
+
+        # Prefill path.
+        compressor.reset_state(1)
+        out_prefill = compressor(x, start_pos=0)
+        self.assertIsNotNone(out_prefill)
+        self.assertEqual(out_prefill.shape, (1, 4, args.head_dim))
+
+        # Streamed decode path.
+        compressor.reset_state(1)
+        streamed = []
+        for t in range(16):
+            row = compressor(x[:, t : t + 1, :], start_pos=t)
+            if row is not None:
+                streamed.append(row)
+        self.assertEqual(len(streamed), 4)
+        out_stream = mx.concatenate(streamed, axis=1)
+        self.assertEqual(out_stream.shape, (1, 4, args.head_dim))
+
+        # Parity within fp32 tolerance. The pooling is fp32 internally, final
+        # cast back to input dtype (float32 here).
+        diff = mx.max(mx.abs(out_prefill - out_stream)).item()
+        self.assertLess(diff, 1e-4, f"prefill/decode parity failed: max diff {diff}")
+
+    def test_deepseek_v4_compressor_prefill_decode_parity_ratio128(self):
+        # Non-overlap path (ratio != 4). 256 tokens => 2 rows.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=32,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=8,
+            compress_ratios=[128],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=0,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=512,
+            compress_rope_theta=160000.0,
+        )
+        mx.random.seed(1)
+        compressor = deepseek_v4.Compressor(args, compress_ratio=128, head_dim=args.head_dim)
+        compressor.ape = mx.random.normal((128, args.head_dim), dtype=mx.float32)
+        mx.eval(compressor.parameters())
+
+        x = mx.random.normal((1, 256, args.hidden_size), dtype=mx.float32)
+
+        compressor.reset_state(1)
+        out_prefill = compressor(x, start_pos=0)
+        self.assertEqual(out_prefill.shape, (1, 2, args.head_dim))
+
+        compressor.reset_state(1)
+        streamed = []
+        for t in range(256):
+            row = compressor(x[:, t : t + 1, :], start_pos=t)
+            if row is not None:
+                streamed.append(row)
+        self.assertEqual(len(streamed), 2)
+        out_stream = mx.concatenate(streamed, axis=1)
+
+        diff = mx.max(mx.abs(out_prefill - out_stream)).item()
+        self.assertLess(diff, 1e-4, f"prefill/decode parity failed: max diff {diff}")
+
     def test_deepseek_v4_compressed_kv_cache_roundtrip(self):
         from mlx_lm.models.cache import CompressedKVCache
 

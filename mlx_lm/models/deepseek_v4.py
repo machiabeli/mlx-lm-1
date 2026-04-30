@@ -459,6 +459,13 @@ class CompressedKVCache(KVCache):
         self._pool = None
         self._buf = None
         self._buf_count = 0
+        # Most-recent fully-processed chunk of raw hidden states. Required by
+        # ratio-4 (overlap=True) compressors to recreate the cross-chunk
+        # overlap pattern during single-step decode emission. Without this,
+        # decode-emitted compressed rows only see the current chunk's
+        # second-half features, while the prefill path's row K (K>=1) sees
+        # chunk K-1's first-half features in addition. (Bug @anerjy phase 2.)
+        self._prev_chunk = None
 
     @property
     def offset(self):
@@ -494,6 +501,8 @@ class CompressedKVCache(KVCache):
             n += self._pool.nbytes
         if self._buf is not None:
             n += self._buf.nbytes
+        if self._prev_chunk is not None:
+            n += self._prev_chunk.nbytes
         return n
 
     @property
@@ -559,6 +568,24 @@ class CompressedKVCache(KVCache):
             merged._buf = mx.concatenate(padded, axis=0)
             merged._buf_count = max_bc
 
+        # Merge prev_chunks: each is shape [1, r, D] or None. Pad a missing
+        # one with zeros so the batch dim aligns; length r is per-layer
+        # constant so all non-None entries match.
+        prev_chunks = [c._prev_chunk for c in caches]
+        if all(pc is None for pc in prev_chunks):
+            merged._prev_chunk = None
+        else:
+            ref = next(pc for pc in prev_chunks if pc is not None)
+            r_len, D = ref.shape[1], ref.shape[2]
+            dtype = ref.dtype
+            merged._prev_chunk = mx.concatenate(
+                [
+                    pc if pc is not None else mx.zeros((1, r_len, D), dtype=dtype)
+                    for pc in prev_chunks
+                ],
+                axis=0,
+            )
+
         return merged
 
     def filter(self, batch_indices):
@@ -568,6 +595,8 @@ class CompressedKVCache(KVCache):
             self._pool = self._pool[batch_indices]
         if self._buf is not None:
             self._buf = self._buf[batch_indices]
+        if self._prev_chunk is not None:
+            self._prev_chunk = self._prev_chunk[batch_indices]
 
     def extend(self, other):
         if hasattr(self.local, 'extend'):
@@ -605,6 +634,19 @@ class CompressedKVCache(KVCache):
             self._buf = mx.concatenate([pad_buf(self._buf, max_bc), pad_buf(other._buf, max_bc)], axis=0)
             self._buf_count = max_bc
 
+        # Extend prev_chunks similarly so future decode emissions on the
+        # batched cache see each batch member's own previous chunk.
+        if self._prev_chunk is None and other._prev_chunk is None:
+            pass
+        elif self._prev_chunk is None:
+            self._prev_chunk = other._prev_chunk
+        elif other._prev_chunk is None:
+            pass
+        else:
+            self._prev_chunk = mx.concatenate(
+                [self._prev_chunk, other._prev_chunk], axis=0
+            )
+
     def finalize(self):
         if hasattr(self.local, 'finalize'):
             self.local.finalize()
@@ -615,6 +657,9 @@ class CompressedKVCache(KVCache):
         extracted._pool = self._pool[idx:idx+1] if self._pool is not None else None
         extracted._buf = self._buf[idx:idx+1] if self._buf is not None else None
         extracted._buf_count = self._buf_count
+        extracted._prev_chunk = (
+            self._prev_chunk[idx:idx+1] if self._prev_chunk is not None else None
+        )
         return extracted
 
     @property
@@ -635,12 +680,18 @@ class CompressedKVCache(KVCache):
         """
         B, S, D = x.shape
         r = compressor.ratio
+        overlap = compressor.overlap
 
         if S > 1:
             ckv = compressor(x)
             if ckv.shape[1] > 0:
                 self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
             remainder = S % r
+            keep = S - remainder
+            if keep >= r:
+                # Save the most-recent fully-consumed chunk so subsequent
+                # single-step decode emissions can reproduce ratio-4 overlap.
+                self._prev_chunk = x[:, keep - r : keep]
             if remainder > 0:
                 self._buf = x[:, -remainder:]
                 self._buf_count = remainder
@@ -657,9 +708,25 @@ class CompressedKVCache(KVCache):
             self._buf_count += 1
 
         if self._buf_count >= r:
-            ckv = compressor(self._buf[:, :r])
+            cur_chunk = self._buf[:, :r]
+            if overlap and self._prev_chunk is not None:
+                # Recreate the prefill-path's cross-chunk overlap: feed both
+                # the previous and current chunks to the compressor, which
+                # internally produces 2 rows; row 1 is the cross-chunk row
+                # (chunk-prev's first-half + chunk-cur's second-half features
+                # under overlap_transform). We discard row 0 since it's the
+                # "self-overlap" of the previous chunk (already in the pool).
+                pair = mx.concatenate([self._prev_chunk, cur_chunk], axis=1)
+                ckv_full = compressor(pair)            # shape [B, 2, head_dim]
+                ckv = ckv_full[:, 1:2]                 # take only row 1
+            else:
+                # First emission ever, or non-overlap compressor: row 0 from
+                # current chunk only is the right answer (matches prefill of
+                # length r exactly).
+                ckv = compressor(cur_chunk)
             if ckv.shape[1] > 0:
                 self._pool = ckv if self._pool is None else mx.concatenate([self._pool, ckv], axis=1)
+            self._prev_chunk = cur_chunk
             if self._buf_count > r:
                 self._buf = self._buf[:, r:]
                 self._buf_count -= r
@@ -853,6 +920,15 @@ class V4Attention(nn.Module):
         kv = kv.reshape(B, 1, S, self.head_dim)
 
         offset = cache.offset if cache is not None else 0
+        # Some cache implementations (e.g. vllm-mlx's BatchedEngine
+        # CompressedKVCache) return cache.offset as a 0-D mx.array
+        # rather than a Python int. mx.arange(...) at line ~977 below
+        # rejects mx.array positional args (see RoPE __call__ at line 241
+        # which already does the same coercion). Without this we hit
+        # `TypeError: arange(): incompatible function arguments` on every
+        # decode step the moment cache is non-None.
+        if isinstance(offset, mx.array):
+            offset = offset.item()
 
         # Apply RoPE only to the last rope_head_dim dims
         q_nope, q_pe = mx.split(q,  [self.nope_head_dim], axis=-1)
@@ -897,9 +973,35 @@ class V4Attention(nn.Module):
             v = mx.concatenate([compressed_v, v], axis=2)
             n_comp = compressed_k.shape[2]
             if mask is not None:
+                # Causal pool mask: row k of the compressed pool summarizes
+                # tokens up to logical position (k+1)*r - 1. A query at logical
+                # position p must only attend row k when that summary is
+                # complete, i.e. p >= (k+1)*r - 1. Without this, a re-prefill
+                # forward sees future-summarizing rows from non-last queries
+                # while the with-cache forward (which builds the pool
+                # incrementally) does not, producing per-position layer
+                # outputs that diverge — and any downstream non-compressed
+                # layer caches the divergent K/V. (Bug @anerjy phase 3.)
+                r = self.compress_ratio
+                q_pos = mx.arange(offset, offset + S).reshape(S, 1)
+                k_idx = mx.arange(n_comp).reshape(1, n_comp)
+                comp_visible = (q_pos + 1) >= (k_idx + 1) * r  # [S, n_comp] bool
+                # Broadcast comp_visible to mask's leading dims (mask may be
+                # [S, K] or have head/batch dims). create_causal_mask returns
+                # [S, S+offset] so we just reshape; downstream concatenate
+                # along the key axis handles broader shapes via broadcasting
+                # rules in mx.fast.scaled_dot_product_attention.
                 comp_shape = list(mask.shape)
                 comp_shape[-1] = n_comp
-                comp_mask = mx.zeros(comp_shape, dtype=mask.dtype)
+                if mask.dtype == mx.bool_:
+                    comp_mask = mx.broadcast_to(comp_visible, comp_shape)
+                else:
+                    comp_mask = mx.where(
+                        comp_visible,
+                        mx.zeros((), dtype=mask.dtype),
+                        mx.array(mx.finfo(mask.dtype).min, dtype=mask.dtype),
+                    )
+                    comp_mask = mx.broadcast_to(comp_mask, comp_shape)
                 mask = mx.concatenate([comp_mask, mask], axis=-1)
 
         out = scaled_dot_product_attention(
@@ -1068,9 +1170,16 @@ class DeepseekV4Model(nn.Module, PipelineMixin):
             first_cache = first_cache.local
         elif isinstance(first_cache, (list, tuple)):
             first_cache = first_cache[0]
+        # window_size=sliding_window is required even when there's no cache:
+        # the no-cache forward (re-prefill ground truth) must still apply the
+        # same sliding-window cutoff that the with-cache RotatingKVCache
+        # physically enforces by dropping evicted keys, otherwise Path A's
+        # last-position attention sees more keys than Path B once
+        # offset > sliding_window. (Bug @anerjy phase 4.)
         mask = create_attention_mask(
             h[:, :, 0, :],
             first_cache if first_cache is not None else None,
+            window_size=self.args.sliding_window,
             return_array=True,
         )
 

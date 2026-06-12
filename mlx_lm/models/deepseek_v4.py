@@ -939,15 +939,42 @@ class V4Attention(nn.Module):
                 comp_mask = mx.zeros(comp_shape, dtype=mask.dtype)
                 mask = mx.concatenate([comp_mask, mask], axis=-1)
 
-        out = scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
-        )
+        sinks = self.attn_sink.astype(q.dtype)
+        if q.shape[2] == 1 and sinks is not None:
+            # Workaround for mlx#3452: ``mx.fast.scaled_dot_product_attention``
+            # with ``sinks=`` diverges between S=1 (decode) and S>=2 (prefill)
+            # by ~1 ULP. The drift compounds through DeepSeek-V4's 43 layers
+            # (amplified by mHC + Sinkhorn + 4-bit MoE) and flips the greedy
+            # argmax on long-prompt decode -- PR #1189 review documents the
+            # S=1/long-prompt failure. Pad ``q`` to S=2 (duplicate the single
+            # decode query), invoke the S>=2 code path which is correct, and
+            # slice the first row back. Both rows see the same q/k/v/mask, so
+            # they produce identical outputs and the slice is exact. Remove
+            # this branch once mlx#3452 lands.
+            q_padded = mx.concatenate([q, q], axis=2)
+            mask_padded = mask
+            if mask is not None and mask.shape[-2] == 1:
+                mask_padded = mx.concatenate([mask, mask], axis=-2)
+            out = scaled_dot_product_attention(
+                q_padded,
+                k,
+                v,
+                cache=cache,
+                scale=self.scale,
+                mask=mask_padded,
+                sinks=sinks,
+            )
+            out = out[:, :, :1, :]
+        else:
+            out = scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=sinks,
+            )
 
         out_nope, out_pe = mx.split(out, [self.nope_head_dim], axis=-1)
         out_pe = self.rope(out_pe, offset=offset, inverse=True)

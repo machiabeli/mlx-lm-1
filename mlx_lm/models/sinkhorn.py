@@ -6,7 +6,17 @@ Shared module for models that use learned mixing weights on the Birkhoff
 polytope (e.g., DeepSeek-V4's multi-HyperConnection). Provides both a
 fused Metal kernel (register-resident, one thread per token) and a pure-MLX
 reference path.
+
+The Metal kernel currently produces incorrect results -- the hidden-state
+std explodes across DeepSeek-V4's 43 layers and the resulting `comb`
+matrix diverges from the reference (PR #1189 review comments). The
+pure-MLX path is the verified reference. The kernel is preserved but
+gated behind ``MLX_LM_HC_SINKHORN_KERNEL=1`` so it can be re-enabled
+once it has been validated against the MLX path; the default is the
+correct, slower path.
 """
+
+import os
 
 import mlx.core as mx
 
@@ -242,8 +252,13 @@ def hc_split_sinkhorn(
     pre  = mx.sigmoid(pre_log) + eps
     post = 2 * mx.sigmoid(post_log)
 
+    # The fused Metal kernel is disabled by default: it produces incorrect
+    # results vs the pure-MLX reference (hidden-state std explosion across
+    # DeepSeek-V4's 43 layers; PR #1189 review). Opt in with
+    # ``MLX_LM_HC_SINKHORN_KERNEL=1`` once the kernel has been re-validated.
     use_kernel = (
-        hc_mult <= 8
+        os.environ.get("MLX_LM_HC_SINKHORN_KERNEL") == "1"
+        and hc_mult <= 8
         and mx.metal.is_available()
         and comb_log.size > 0
     )

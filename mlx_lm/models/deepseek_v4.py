@@ -527,52 +527,66 @@ class CompressedKVCache(KVCache):
 
     @classmethod
     def merge(cls, caches):
-        """Merge multiple CompressedKVCaches into a single batched cache."""
+        """Merge multiple CompressedKVCaches into a single batched cache.
+
+        Batched merge is only safe when all input caches are in
+        **synchronized state** -- same ``_pool`` length, same
+        ``_buf_count``, and either all ``_pool``/``_buf`` are ``None`` or
+        none are. Mismatched lengths cannot be padded safely: the previous
+        zero-padding-then-concatenate pattern interleaved padding rows
+        with subsequently-appended real tokens during decode, silently
+        corrupting batched serving (PR #1189 review: "request #2 reads
+        stale pool rows"). When sequences in the batch are at different
+        compression states, ``BatchGenerator`` must align state before
+        merging; this method now raises ``NotImplementedError`` rather
+        than silently corrupting decode output.
+        """
+        if len(caches) > 1:
+            pool_lens = [
+                (c._pool.shape[1] if c._pool is not None else None)
+                for c in caches
+            ]
+            buf_lens = [
+                (c._buf.shape[1] if c._buf is not None else None)
+                for c in caches
+            ]
+            buf_counts = [c._buf_count for c in caches]
+            if (
+                len(set(pool_lens)) > 1
+                or len(set(buf_lens)) > 1
+                or len(set(buf_counts)) > 1
+            ):
+                raise NotImplementedError(
+                    "CompressedKVCache.merge requires all caches to have "
+                    "the same _pool length, _buf length, and _buf_count; "
+                    f"got pool_lens={pool_lens}, buf_lens={buf_lens}, "
+                    f"buf_counts={buf_counts}. Mismatched lengths cannot "
+                    "be merged safely: zero-padding would interleave with "
+                    "real tokens appended during decode, corrupting "
+                    "subsequent requests (PR #1189 review)."
+                )
+
         merged = cls.__new__(cls)
 
         # Merge local rotating caches (delegates to BatchRotatingKVCache)
         merged.local = caches[0].local.merge([c.local for c in caches])
 
-        # Merge compressed pools: pad to max length, stack along B
+        # All pools share the same length (validated above); plain
+        # concatenation is safe and introduces no per-row padding.
         pools = [c._pool for c in caches]
         if all(p is None for p in pools):
             merged._pool = None
         else:
-            head_dim = next(p.shape[-1] for p in pools if p is not None)
-            dtype = next(p.dtype for p in pools if p is not None)
-            max_len = max(p.shape[1] if p is not None else 0 for p in pools)
-            padded = []
-            for p in pools:
-                if p is None:
-                    padded.append(mx.zeros((1, max_len, head_dim), dtype=dtype))
-                elif p.shape[1] < max_len:
-                    pad = mx.zeros((1, max_len - p.shape[1], head_dim), dtype=dtype)
-                    padded.append(mx.concatenate([p, pad], axis=1))
-                else:
-                    padded.append(p)
-            merged._pool = mx.concatenate(padded, axis=0)
+            merged._pool = mx.concatenate(pools, axis=0)
 
-        # Merge buffers: pad to max buf_count, stack along B
+        # Buffers likewise share the same length and count.
         bufs = [c._buf for c in caches]
-        buf_counts = [c._buf_count for c in caches]
         if all(b is None for b in bufs):
             merged._buf = None
             merged._buf_count = 0
         else:
-            D = next(b.shape[-1] for b in bufs if b is not None)
-            dtype = next(b.dtype for b in bufs if b is not None)
-            max_bc = max(buf_counts)
-            padded = []
-            for b, bc in zip(bufs, buf_counts):
-                if b is None:
-                    padded.append(mx.zeros((1, max_bc, D), dtype=dtype))
-                elif b.shape[1] < max_bc:
-                    pad = mx.zeros((1, max_bc - b.shape[1], D), dtype=dtype)
-                    padded.append(mx.concatenate([b, pad], axis=1))
-                else:
-                    padded.append(b)
-            merged._buf = mx.concatenate(padded, axis=0)
-            merged._buf_count = max_bc
+            merged._buf = mx.concatenate(bufs, axis=0)
+            merged._buf_count = caches[0]._buf_count
 
         return merged
 
@@ -585,40 +599,56 @@ class CompressedKVCache(KVCache):
             self._buf = self._buf[batch_indices]
 
     def extend(self, other):
+        """Append ``other``'s rows to ``self`` along the batch dimension.
+
+        Like :meth:`merge`, ``extend`` is only safe when ``self`` and
+        ``other`` are in synchronized state -- same ``_pool`` length and
+        same ``_buf`` length / ``_buf_count``. Mismatched lengths would
+        require zero-padding that subsequently interleaves with appended
+        decode tokens; we raise ``NotImplementedError`` rather than
+        silently corrupt (PR #1189 review).
+        """
         if hasattr(self.local, 'extend'):
             self.local.extend(other.local)
-        # Extend pools
-        if self._pool is None and other._pool is None:
-            pass
-        elif self._pool is None:
-            self._pool = other._pool
-        elif other._pool is None:
-            pass
-        else:
-            max_len = max(self._pool.shape[1], other._pool.shape[1])
-            def pad_pool(p, target):
-                if p.shape[1] < target:
-                    pad = mx.zeros((p.shape[0], target - p.shape[1], p.shape[2]), dtype=p.dtype)
-                    return mx.concatenate([p, pad], axis=1)
-                return p
-            self._pool = mx.concatenate([pad_pool(self._pool, max_len), pad_pool(other._pool, max_len)], axis=0)
-        # Extend buffers
-        if self._buf is None and other._buf is None:
-            pass
-        elif self._buf is None:
-            self._buf = other._buf
-            self._buf_count = other._buf_count
-        elif other._buf is None:
-            pass
-        else:
-            max_bc = max(self._buf.shape[1], other._buf.shape[1])
-            def pad_buf(b, target):
-                if b.shape[1] < target:
-                    pad = mx.zeros((b.shape[0], target - b.shape[1], b.shape[2]), dtype=b.dtype)
-                    return mx.concatenate([b, pad], axis=1)
-                return b
-            self._buf = mx.concatenate([pad_buf(self._buf, max_bc), pad_buf(other._buf, max_bc)], axis=0)
-            self._buf_count = max_bc
+
+        # Validate matching pool state.
+        self_pool_len = self._pool.shape[1] if self._pool is not None else None
+        other_pool_len = other._pool.shape[1] if other._pool is not None else None
+        if (
+            (self._pool is None) != (other._pool is None)
+            or self_pool_len != other_pool_len
+        ):
+            raise NotImplementedError(
+                "CompressedKVCache.extend requires matching pool state; "
+                f"got self pool_len={self_pool_len}, other pool_len="
+                f"{other_pool_len}. Mismatched lengths would interleave "
+                "padding with real tokens during decode (PR #1189 review)."
+            )
+
+        # Validate matching buf state.
+        self_buf_len = self._buf.shape[1] if self._buf is not None else None
+        other_buf_len = other._buf.shape[1] if other._buf is not None else None
+        if (
+            (self._buf is None) != (other._buf is None)
+            or self_buf_len != other_buf_len
+            or self._buf_count != other._buf_count
+        ):
+            raise NotImplementedError(
+                "CompressedKVCache.extend requires matching buf state; "
+                f"got self buf_len={self_buf_len} buf_count="
+                f"{self._buf_count}, other buf_len={other_buf_len} "
+                f"buf_count={other._buf_count}. Mismatched lengths would "
+                "interleave padding with real tokens during decode "
+                "(PR #1189 review)."
+            )
+
+        # Extend pools (matching length, plain concatenation is safe).
+        if self._pool is not None and other._pool is not None:
+            self._pool = mx.concatenate([self._pool, other._pool], axis=0)
+
+        # Extend buffers (matching length and count).
+        if self._buf is not None and other._buf is not None:
+            self._buf = mx.concatenate([self._buf, other._buf], axis=0)
 
     def finalize(self):
         if hasattr(self.local, 'finalize'):

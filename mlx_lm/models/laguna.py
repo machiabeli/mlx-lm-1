@@ -186,7 +186,14 @@ class Router(nn.Module):
     """Sigmoid-scored router (not softmax) with an auxiliary-loss-free
     correction bias (arXiv:2408.15664): the bias shifts which experts are
     *selected* but the returned routing weights stay unbiased (gathered from
-    the un-shifted sigmoid scores, matching the reference)."""
+    the un-shifted sigmoid scores, matching the reference).
+
+    Parameter layout uses ``self.proj`` (nn.Linear) so quantized community
+    checkpoints that store ``mlp.gate.proj.{weight,scales,biases}`` (e.g.
+    Vontra/Laguna-S-2.1-MLX-4bit) load without remapping. Bare HF keys
+    ``mlp.gate.weight`` are rewritten to ``mlp.gate.proj.weight`` in
+    ``Model.sanitize``.
+    """
 
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -194,11 +201,13 @@ class Router(nn.Module):
         self.num_experts = args.num_experts
         self.norm_topk_prob = args.norm_topk_prob
         self.softcapping = args.moe_router_logit_softcapping
-        self.weight = mx.zeros((self.num_experts, args.hidden_size))
+        # Named ``proj`` to match quantized hub exports; keep bias-free —
+        # quant scales/biases attach as sibling arrays under the same module.
+        self.proj = nn.Linear(args.hidden_size, self.num_experts, bias=False)
         self.e_score_correction_bias = mx.zeros((self.num_experts,))
 
     def __call__(self, x: mx.array):
-        logits = (x @ self.weight.T).astype(mx.float32)
+        logits = self.proj(x).astype(mx.float32)
         if self.softcapping > 0.0:
             logits = mx.tanh(logits / self.softcapping) * self.softcapping
         scores = mx.sigmoid(logits)
@@ -335,6 +344,13 @@ class Model(nn.Module):
                 weights[f"{prefix}.gate.e_score_correction_bias"] = weights.pop(
                     bias_key
                 )
+            # Bare HF / unquantized MLX: ``gate.weight`` → ``gate.proj.weight``
+            # so it matches the Router.proj Linear. Quantized community exports
+            # already use ``gate.proj.{weight,scales,biases}`` — leave those.
+            bare_gate = f"{prefix}.gate.weight"
+            proj_gate = f"{prefix}.gate.proj.weight"
+            if bare_gate in weights and proj_gate not in weights:
+                weights[proj_gate] = weights.pop(bare_gate)
             if f"{prefix}.experts.0.gate_proj.weight" not in weights:
                 continue  # dense (mlp_only) layer — nothing to stack
             for name in ("gate_proj", "up_proj", "down_proj"):

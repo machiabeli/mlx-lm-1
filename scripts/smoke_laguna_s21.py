@@ -40,23 +40,35 @@ def main() -> int:
     # Prefer the PYTHONPATH-vendored mlx_lm (with laguna.py) over site-packages.
     from mlx_lm import load, generate
     from mlx_lm.models import laguna as _laguna  # noqa: F401 — force import fail-fast
+    from mlx_lm.sample_utils import make_sampler
 
     print(f"laguna module: {_laguna.__file__}")
     t0 = time.perf_counter()
     print(f"loading {model_path} ...")
-    model, tokenizer = load(str(model_path))
+    loaded = load(str(model_path))
+    model, tokenizer = loaded[0], loaded[1]
     t_load = time.perf_counter() - t0
     print(f"loaded in {t_load:.1f}s")
 
-    # One short generation
+    # Laguna chat template is required — raw prompts loop/degrade.
+    messages = [{"role": "user", "content": args.prompt}]
+    if hasattr(tokenizer, "apply_chat_template"):
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    else:
+        prompt = args.prompt
+    print(f"prompt_preview={prompt[:180]!r}...")
+
+    sampler = make_sampler(temp=args.temp)
     t1 = time.perf_counter()
     text = generate(
         model,
         tokenizer,
-        prompt=args.prompt,
+        prompt=prompt,
         max_tokens=args.max_tokens,
         verbose=True,
-        temp=args.temp,
+        sampler=sampler,
     )
     t_gen = time.perf_counter() - t1
     print("---")

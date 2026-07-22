@@ -4,18 +4,12 @@ at a lower one (2, 4, or 6). The three uniform variants
 (4bit/6bit/8bit-everything) need no custom predicate — use
 `mlx_lm.convert(..., quantize=True, q_bits=4|6|8)` directly.
 
-Note on the router: `Router.weight` (`mlx_lm/models/laguna.py`) is a raw
-array, not an `nn.Linear`, so it has no `to_quantized`.
-`mlx_lm.utils.quantize_model`'s wrapper checks `hasattr(module,
-"to_quantized")` before ever calling a custom `quant_predicate`, so the
-router (and the model's RMSNorm layers) are always left at full precision
-regardless of what a predicate here returns for their paths -- there is no
-way to quantize the router via this mechanism today, and no need to
-special-case it above. Concretely, this means a "protect the router, shrink
-everything else" recipe needs no custom predicate at all: plain
-`mlx_lm.convert(..., quantize=True, q_bits=6)` already leaves the router at
-full precision (stricter than 8-bit) while quantizing attention and routed
-experts uniformly to 6-bit.
+Note on the router: `Router.proj` is an `nn.Linear` (named to match
+community quantized checkpoints that store `mlp.gate.proj.*`). Routing
+quality is sensitive to quant error, so this predicate returns False for
+any path containing `.gate.proj` / ending in `.gate` and leaves the router
+at full precision. RMSNorms are still skipped by mlx_lm's
+`hasattr(module, "to_quantized")` gate.
 
 Usage:
     from mlx_lm.convert import convert
@@ -60,11 +54,13 @@ def build_laguna_quant_predicate(
         )
 
     def predicate(path: str, module: nn.Module) -> Union[bool, dict]:
+        # Keep the MoE router full-precision (see module docstring).
+        if ".gate.proj" in path or path.endswith(".gate") or path.endswith(".gate.proj"):
+            return False
         # Routed experts (SwitchGLU's three projections) get the lower bit
         # width poolside requested; everything else quantizable (attention
         # projections, embeddings, lm_head, the shared expert) stays at
-        # attention_bits. The router never reaches this predicate at all --
-        # see the module docstring -- so it needs no special-casing here.
+        # attention_bits.
         if "switch_mlp" in path:
             return {"group_size": group_size, "bits": expert_bits, "mode": "affine"}
         return {"group_size": group_size, "bits": attention_bits, "mode": "affine"}

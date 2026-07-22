@@ -40,17 +40,25 @@ class TestLagunaQuantPredicate(unittest.TestCase):
                     {"group_size": 64, "bits": expert_bits, "mode": "affine"},
                 )
 
-        non_switch_mlp_paths = [
+        attention_paths = [
             "model.layers.1.self_attn.q_proj",
-            "model.layers.1.mlp.gate",
             "model.layers.1.mlp.shared_expert.gate_proj",
         ]
-        for path in non_switch_mlp_paths:
+        for path in attention_paths:
             with self.subTest(path=path):
                 self.assertEqual(
                     predicate(path, module),
                     {"group_size": 64, "bits": attention_bits, "mode": "affine"},
                 )
+
+        # Router must stay full-precision (nn.Linear under gate.proj).
+        router_paths = [
+            "model.layers.1.mlp.gate",
+            "model.layers.1.mlp.gate.proj",
+        ]
+        for path in router_paths:
+            with self.subTest(path=path):
+                self.assertIs(predicate(path, module), False)
 
     def test_expert_bits_4(self):
         self._check_paths(expert_bits=4)
@@ -132,7 +140,9 @@ class TestLagunaQuantPredicateAgainstRealModel(unittest.TestCase):
 
         router = quantized_model.model.layers[0].mlp.gate
         self.assertIsInstance(router, laguna.Router)
-        self.assertEqual(router.weight.dtype, mx.float32)
+        # Router stores the routing matrix on nn.Linear `proj` (quantized
+        # community checkpoints use gate.proj.*); keep it full-precision.
+        self.assertEqual(router.proj.weight.dtype, mx.float32)
 
         norm = quantized_model.model.layers[0].input_layernorm
         self.assertIsInstance(norm, nn.RMSNorm)

@@ -15,6 +15,8 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+from mlx.nn.layers.distributed import shard_inplace, shard_linear
+
 from .mla import MultiLinear
 from .switch_layers import SwiGLU, SwitchGLU
 
@@ -79,6 +81,38 @@ class ModelArgs(BaseModelArgs):
         if not self.head_dim:
             nope = self.qk_nope_head_dim or 0
             self.head_dim = nope or (self.hidden_size // self.num_attention_heads)
+
+        # Fail closed on a PARTIAL K3 config. Each K3 field defaults to the
+        # Kimi-Linear behaviour, which is right for a genuine Kimi-Linear
+        # checkpoint but dangerous for a truncated/edited K3 one: the model
+        # would build and emit plausible garbage instead of raising. If ANY
+        # K3 discriminator is present, demand the whole set.
+        k3_markers = {
+            "attn_res_block_size": self.attn_res_block_size,
+            "routed_expert_hidden_size": self.routed_expert_hidden_size,
+            "q_lora_rank": self.q_lora_rank,
+        }
+        present = [k for k, v in k3_markers.items() if v is not None]
+        if present and self.hidden_act != "situ":
+            raise ValueError(
+                f"config sets K3 keys {present} but hidden_act is "
+                f"{self.hidden_act!r}; expected \"situ\". Refusing to build a "
+                "half-K3 model that would silently produce wrong output."
+            )
+        if self.hidden_act == "situ":
+            missing = [k for k, v in k3_markers.items() if v is None]
+            if missing:
+                raise ValueError(
+                    f"hidden_act=\"situ\" indicates a Kimi-K3 config but "
+                    f"{missing} are absent. A K3 checkpoint carries all of "
+                    "them; a partial config would disable those mechanisms "
+                    "silently."
+                )
+        if self.attn_res_block_size is not None and self.attn_res_block_size <= 0:
+            raise ValueError(
+                f"attn_res_block_size must be positive, got "
+                f"{self.attn_res_block_size}"
+            )
 
 
 def situ(gate: mx.array, up: mx.array, beta: float,
@@ -177,6 +211,12 @@ class KimiSparseMoE(nn.Module):
             raise ValueError("num_experts must be specified for MoE layers")
 
         self.gate = nn.Linear(hidden, experts, bias=False)
+        # Set by Model.shard(). SwitchGLU/SwitchLinear contain NO distributed
+        # code -- `shard_inplace` only slices the weights, and its own docstring
+        # says "the module needs to natively support it". So unlike nn.Linear's
+        # "sharded-to-all", nothing reduces the expert output automatically and
+        # this class must issue the all_sum itself (see __call__).
+        self.sharding_group = None
 
         # Latent MoE (K3): experts live in routed_expert_hidden_size space, not
         # hidden_size, with down/up projections either side. On K3 that is
@@ -229,6 +269,14 @@ class KimiSparseMoE(nn.Module):
         h = self.routed_expert_down_proj(x) if self.use_latent else x
         out = self.switch_mlp(h, inds)
         out = (out * weights[..., None]).sum(axis=-2)
+        if self.sharding_group is not None:
+            # Each rank holds 1/N of every expert's FFN width, so `out` is a
+            # partial sum. Reduce AFTER the top-k weighting: the weights are
+            # identical on every rank (the router is replicated and scores the
+            # full hidden state), so weight-then-sum and sum-then-weight agree,
+            # and doing it here means ONE collective per MoE layer instead of
+            # one per selected expert.
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
         if self.use_latent:
             if self.routed_expert_norm is not None:
                 out = self.routed_expert_norm(out)
@@ -579,7 +627,8 @@ def _fuse_mxfp4(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
             # far cheaper to diagnose than garbage logits later.
             raise ValueError(f"{pk} has no matching {sk}")
         if p.dtype == mx.uint8:
-            u = p.reshape(*p.shape[:-1], -1, 4).astype(mx.uint32)
+            per_word = 32 // (2 * _MXFP4_BITS)  # uint8 codes packed per uint32
+            u = p.reshape(*p.shape[:-1], -1, per_word).astype(mx.uint32)
             p = u[..., 0] | (u[..., 1] << 8) | (u[..., 2] << 16) | (u[..., 3] << 24)
         weights[f"{base}.weight"] = p
         weights[f"{base}.scales"] = scale
@@ -613,8 +662,10 @@ class KimiDecoderLayer(nn.Module):
 
         self.layer_idx = layer_idx
         self.eps = args.rms_norm_eps
+        # ModelArgs.__post_init__ rejects non-positive values, so a set
+        # block size is always usable here.
         self.attn_res_block_size = args.attn_res_block_size or 0
-        self.use_attn_residuals = args.attn_res_block_size is not None
+        self.use_attn_residuals = bool(args.attn_res_block_size)
         if self.use_attn_residuals:
             self.self_attention_res_norm = nn.RMSNorm(
                 args.hidden_size, eps=args.rms_norm_eps
@@ -665,10 +716,16 @@ class KimiDecoderLayer(nn.Module):
         y = self.self_attn(self.input_layernorm(h), mask, attn_cache)
         prefix_sum = y if prefix_sum is None else prefix_sum + y
 
-        # block_residual is non-None here: layer 0 satisfies
-        # `layer_idx % block_size == 0` and pushes the first summary, so every
-        # layer reaches this point with at least one entry on the stack.
-        assert block_residual is not None
+        if block_residual is None:
+            # Unreachable by construction: layer 0 satisfies
+            # `layer_idx % block_size == 0` and pushes the first summary, so
+            # every layer arrives with at least one entry. Raise rather than
+            # assert -- asserts vanish under `python -O`, which would turn a
+            # guaranteed invariant into a cryptic failure inside _apply_attn_res.
+            raise RuntimeError(
+                f"attention-residual stack empty at layer {self.layer_idx} "
+                f"(attn_res_block_size={self.attn_res_block_size})"
+            )
         h = _apply_attn_res(
             prefix_sum,
             block_residual,
@@ -745,6 +802,151 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def shard(self, group: Optional[Any] = None):
+        """Tensor-parallel shard across `group`.
+
+        WHY TP AND NOT PIPELINE: K3 is memory-bandwidth bound at inference --
+        ~87 GB of weights are read per generated token. A pipeline split runs
+        one node at a time, so the ceiling stays at a SINGLE node's bandwidth
+        no matter how many nodes join; extra nodes buy capacity, not speed.
+        Tensor parallel has every rank read 1/N of each layer concurrently, so
+        the denominator becomes the AGGREGATE bandwidth. On a 4-node mesh that
+        is the difference between ~9 tok/s and ~37 tok/s.
+
+        Two sharding modes compose so each block needs only ONE collective per
+        attention and one per MLP -- that is what makes this viable over an
+        interconnect rather than a fantasy:
+          * "all-to-sharded"  — replicated input, this rank computes its slice
+                                of the output. Used on fan-OUT projections.
+          * "sharded-to-all"  — sharded input, all_sum reconstructs the full
+                                output. Used on fan-IN projections.
+        """
+        group = group or mx.distributed.init()
+        if group is None:
+            raise RuntimeError("no distributed group available to shard across")
+        N = group.size()
+        if N == 1:
+            return
+
+        def _slice(w: mx.array, axis: int) -> mx.array:
+            if w.shape[axis] % N:
+                raise ValueError(
+                    f"cannot shard axis {axis} of shape {w.shape} across {N} "
+                    "ranks: not divisible"
+                )
+            step = w.shape[axis] // N
+            start = group.rank() * step
+            return mx.contiguous(
+                mx.slice(w, mx.array([start]), (axis,), [*w.shape[:axis], step,
+                                                        *w.shape[axis + 1:]])
+            )
+
+        for layer in self.layers:
+            attn = layer.self_attn
+
+            if layer.is_linear:
+                # ── KDA ──────────────────────────────────────────────────
+                # q/k/v and the gate fan out to projection_dim; o_proj folds
+                # back to hidden. Shard on the head axis throughout.
+                for name in ("q_proj", "k_proj", "v_proj"):
+                    setattr(attn, name, shard_linear(
+                        getattr(attn, name), "all-to-sharded", group=group))
+                attn.f_b_proj = shard_linear(
+                    attn.f_b_proj, "all-to-sharded", group=group)
+                if attn.use_full_rank_gate:
+                    attn.g_proj = shard_linear(
+                        attn.g_proj, "all-to-sharded", group=group)
+                else:
+                    attn.g_b_proj = shard_linear(
+                        attn.g_b_proj, "all-to-sharded", group=group)
+                attn.o_proj = shard_linear(
+                    attn.o_proj, "sharded-to-all", group=group)
+
+                # b_proj is per-HEAD (out = num_heads), not per-channel.
+                attn.b_proj = shard_linear(
+                    attn.b_proj, "all-to-sharded", group=group)
+
+                # The short convs are DEPTHWISE over projection_dim, so each
+                # channel is independent and slicing loses no information --
+                # but the conv weight must slice on the SAME axis as the
+                # projections feeding it or the shapes desync silently.
+                for cname in ("q_conv", "k_conv", "v_conv"):
+                    sc = getattr(attn, cname)
+                    conv = sc.conv
+                    conv.weight = _slice(conv.weight, 0)
+                    # groups == channels for a depthwise conv, so it must
+                    # shrink with the weight. Slicing the weight alone leaves
+                    # mx.conv1d asserting "input channels must be divisible by
+                    # the number of groups" -- which is the good outcome; the
+                    # bad one would be a groups value that still divides and
+                    # silently mixes channels across the shard boundary.
+                    conv.groups = conv.weight.shape[0]
+                attn.dt_bias = _slice(attn.dt_bias, 0)
+                # A_log is (1, 1, num_heads, 1) — per head.
+                attn.A_log = _slice(attn.A_log, 2)
+
+                attn.num_heads //= N
+                attn.projection_dim //= N
+            else:
+                # ── MLA ──────────────────────────────────────────────────
+                # The query path fans out to num_heads * q_head_dim; only the
+                # LAST projection of the low-rank chain is sharded so the
+                # bottleneck stays replicated (it is tiny and shared).
+                if attn.q_lora_rank:
+                    attn.q_b_proj = shard_linear(
+                        attn.q_b_proj, "all-to-sharded", group=group)
+                else:
+                    attn.q_proj = shard_linear(
+                        attn.q_proj, "all-to-sharded", group=group)
+
+                # kv_a_proj_with_mqa produces the SHARED latent + rope key.
+                # It stays replicated: every rank needs the whole latent
+                # because MLA's KV is head-agnostic by construction.
+                # embed_q / unembed_out are MultiLinear [heads, out, in] --
+                # slicing the head axis gives each rank whole heads, so no
+                # collective is needed here at all.
+                attn.embed_q.weight = _slice(attn.embed_q.weight, 0)
+                attn.unembed_out.weight = _slice(attn.unembed_out.weight, 0)
+
+                if attn.use_output_gate:
+                    attn.g_proj = shard_linear(
+                        attn.g_proj, "all-to-sharded", group=group)
+                attn.o_proj = shard_linear(
+                    attn.o_proj, "sharded-to-all", group=group)
+
+                attn.num_heads //= N
+                attn.num_key_value_heads //= N
+
+            # ── MLP / MoE ────────────────────────────────────────────────
+            mlp = layer.mlp
+            if isinstance(mlp, KimiSparseMoE):
+                # Every rank keeps ALL 896 experts but only 1/N of each
+                # expert's width. That is the point: it divides the per-token
+                # weight READ, which routing-based expert-parallel does not.
+                shard_inplace(mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
+                shard_inplace(mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
+                shard_inplace(mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+                mlp.sharding_group = group
+                if mlp.shared_experts is not None:
+                    mlp.shared_experts.gate_proj = shard_linear(
+                        mlp.shared_experts.gate_proj, "all-to-sharded", group=group)
+                    mlp.shared_experts.up_proj = shard_linear(
+                        mlp.shared_experts.up_proj, "all-to-sharded", group=group)
+                    mlp.shared_experts.down_proj = shard_linear(
+                        mlp.shared_experts.down_proj, "sharded-to-all", group=group)
+                # The latent down/up projections and the router are NOT
+                # sharded: the router must score against the full hidden
+                # state, and the latent projections bracket the sharded
+                # region, so sharding them would need extra collectives for
+                # no bandwidth win.
+            else:
+                mlp.gate_proj = shard_linear(
+                    mlp.gate_proj, "all-to-sharded", group=group)
+                mlp.up_proj = shard_linear(
+                    mlp.up_proj, "all-to-sharded", group=group)
+                mlp.down_proj = shard_linear(
+                    mlp.down_proj, "sharded-to-all", group=group)
 
     def make_cache(self):
         caches: List[Any] = []
@@ -828,6 +1030,17 @@ class Model(nn.Module):
                 if bias_key in weights:
                     weights[f"{dst_prefix}.e_score_correction_bias"] = weights.pop(
                         bias_key
+                    )
+
+                # Stacking keys off expert 0. If a checkpoint were ragged --
+                # expert 0 missing a component others carry -- the strays would
+                # be dropped silently and the model would load with garbage in
+                # those experts. Cheap to check, impossible to debug otherwise.
+                strays = [k for k in weights if k.startswith(f"{src_prefix}.experts.")]
+                if strays:
+                    raise ValueError(
+                        f"{len(strays)} expert tensor(s) left unconsumed under "
+                        f"{src_prefix} after stacking, e.g. {strays[:3]}"
                     )
 
             attn = getattr(layer, "self_attn", None)

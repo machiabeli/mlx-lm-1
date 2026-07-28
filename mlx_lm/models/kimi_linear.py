@@ -470,8 +470,14 @@ class KimiDeltaAttention(nn.Module):
         v = v_conv.reshape(B, T, self.num_heads, self.head_dim)
 
         inv_scale = self.scale
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # The reference uses l2norm: x / sqrt(sum(x^2) + 1e-6). mx.fast.rms_norm
+        # adds eps to MEAN(x^2), so the equivalent epsilon is 1e-6 / head_dim --
+        # a plain 1e-6 here is head_dim (128) times too large, and the error
+        # compounds through the delta-rule recurrence across all 69 KDA layers.
+        # Matches upstream mlx-lm#1624.
+        eps = 1e-6 / self.head_dim
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, eps)
 
         a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim

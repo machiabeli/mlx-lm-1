@@ -252,7 +252,21 @@ class KimiMLAAttention(nn.Module):
         self.scale = self.q_head_dim**-0.5
 
         hidden = args.hidden_size
-        self.q_proj = nn.Linear(hidden, self.num_heads * self.q_head_dim, bias=False)
+        # DeepSeek-style low-rank query path. Kimi-Linear projects q densely;
+        # K3 sets q_lora_rank (1536) and factors it through a normed
+        # bottleneck, so the checkpoint carries q_a_proj/q_a_layernorm/q_b_proj
+        # and NO q_proj.
+        self.q_lora_rank = args.q_lora_rank
+        if self.q_lora_rank:
+            self.q_a_proj = nn.Linear(hidden, self.q_lora_rank, bias=False)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=args.rms_norm_eps)
+            self.q_b_proj = nn.Linear(
+                self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+            )
+        else:
+            self.q_proj = nn.Linear(
+                hidden, self.num_heads * self.q_head_dim, bias=False
+            )
         self.kv_a_proj_with_mqa = nn.Linear(
             hidden,
             args.kv_lora_rank + self.qk_rope_head_dim,
@@ -283,7 +297,11 @@ class KimiMLAAttention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
-        q = self.q_proj(x).reshape(B, L, self.num_heads, self.q_head_dim)
+        if self.q_lora_rank:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+        else:
+            q = self.q_proj(x)
+        q = q.reshape(B, L, self.num_heads, self.q_head_dim)
         q = q.transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
@@ -392,8 +410,17 @@ class KimiDeltaAttention(nn.Module):
         self.f_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
         self.b_proj = nn.Linear(hidden, self.num_heads, bias=False)
 
-        self.g_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
-        self.g_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
+        # KDA's output gate comes in two forms. Kimi-Linear factors it through
+        # a head_dim bottleneck (g_a_proj -> g_b_proj); K3 sets
+        # linear_attn_config.use_full_rank_gate and ships one dense g_proj
+        # instead. Supporting only the low-rank pair leaves g_proj unconsumed
+        # and both gate weights missing on a real K3 checkpoint.
+        self.use_full_rank_gate = bool(cfg.get("use_full_rank_gate", False))
+        if self.use_full_rank_gate:
+            self.g_proj = nn.Linear(hidden, self.projection_dim, bias=False)
+        else:
+            self.g_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
+            self.g_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
 
         self.A_log = mx.expand_dims(
             mx.log(mx.random.uniform(low=1.0, high=16.0, shape=(self.num_heads,))),
@@ -468,9 +495,11 @@ class KimiDeltaAttention(nn.Module):
             cache[3] = ssm_state
             cache.advance(T)
 
-        gate = self.g_b_proj(self.g_a_proj(x)).reshape(
-            B, T, self.num_heads, self.head_dim
-        )
+        gate = (
+            self.g_proj(x)
+            if self.use_full_rank_gate
+            else self.g_b_proj(self.g_a_proj(x))
+        ).reshape(B, T, self.num_heads, self.head_dim)
         out = (
             self.o_norm(out.reshape(B, T, self.num_heads, self.head_dim))
             * mx.sigmoid(gate)

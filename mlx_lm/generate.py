@@ -1063,11 +1063,35 @@ def _make_cache(model, left_padding, max_kv_size):
         return [BatchKVCache(left_padding) for _ in model.layers]
 
 
-def _merge_caches(caches):
+def _supports_batching(value):
+    """Read the non-mutating batching capability contract, defaulting to true."""
+    capability = getattr(value, "supports_batching", True)
+    return capability() if callable(capability) else capability
+
+
+def _cache_supports_batching(prompt_cache):
+    if not _supports_batching(prompt_cache):
+        return False
+    if isinstance(prompt_cache, CacheList):
+        return all(_cache_supports_batching(c) for c in prompt_cache.caches)
+    return True
+
+
+def _caches_support_batching(prompt_cache):
+    return all(_cache_supports_batching(c) for c in prompt_cache)
+
+
+def _merge_caches(caches, supports_batching=True):
     batch_cache = []
 
     if not caches:
         return batch_cache
+
+    # Singleton-only models or caches must keep every cache layer in its serial form.
+    # Mixing serial and batch cache implementations can change mask and offset
+    # semantics even when the nominal batch size is one.
+    if len(caches) == 1 and not supports_batching:
+        return copy.deepcopy(caches[0])
 
     for i in range(len(caches[0])):
         if hasattr(caches[0][i], "merge"):
@@ -1229,7 +1253,10 @@ class PromptProcessingBatch:
     ):
         self.model = model
         self.uids = uids
-        self.prompt_cache = _merge_caches(caches)
+        self._supports_batching = _supports_batching(model) and all(
+            _caches_support_batching(prompt_cache) for prompt_cache in caches
+        )
+        self.prompt_cache = _merge_caches(caches, self._supports_batching)
         self.tokens = tokens if tokens is not None else [[] for _ in uids]
 
         self.prefill_step_size = prefill_step_size
@@ -1253,9 +1280,16 @@ class PromptProcessingBatch:
         return len(self.uids)
 
     def extract_cache(self, idx: int) -> List[Any]:
+        if not self._supports_batching:
+            if len(self.uids) != 1 or idx != 0:
+                raise ValueError("Singleton cache extraction requires index 0")
+            return copy.deepcopy(self.prompt_cache)
         return [c.extract(idx) for c in self.prompt_cache]
 
     def extend(self, batch):
+        self._supports_batching = (
+            self._supports_batching and batch._supports_batching
+        )
         if not any(self.samplers):
             self.samplers = [None] * len(self.uids)
         if not any(self.logits_processors):
@@ -1278,6 +1312,7 @@ class PromptProcessingBatch:
     def _copy(self):
         new_batch = self.__class__.__new__(self.__class__)
         new_batch.model = self.model
+        new_batch._supports_batching = self._supports_batching
         new_batch.uids = list(self.uids)
         new_batch.prompt_cache = copy.deepcopy(self.prompt_cache)
         new_batch.tokens = list(self.tokens)
@@ -1299,10 +1334,13 @@ class PromptProcessingBatch:
         return new_batch
 
     def filter(self, keep: List[int]):
+        keep_singleton_cache = (
+            not self._supports_batching and len(self.uids) == 1 and keep == [0]
+        )
         self.uids = [self.uids[idx] for idx in keep]
         if not keep:
             self.prompt_cache.clear()
-        else:
+        elif not keep_singleton_cache:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
@@ -1457,6 +1495,9 @@ class GenerationBatch:
         max_tokens: List[int],
     ):
         self.model = model
+        self._supports_batching = (
+            _supports_batching(model) and _caches_support_batching(prompt_cache)
+        )
         self.uids = uids
         self.prompt_cache = prompt_cache
         self.tokens = tokens
@@ -1488,6 +1529,9 @@ class GenerationBatch:
 
     def extend(self, batch):
         """Extend this batch with another generation batch."""
+        self._supports_batching = (
+            self._supports_batching and batch._supports_batching
+        )
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
@@ -1574,14 +1618,21 @@ class GenerationBatch:
         return inputs, self._current_logprobs
 
     def extract_cache(self, idx: int) -> List[Any]:
+        if not self._supports_batching:
+            if len(self.uids) != 1 or idx != 0:
+                raise ValueError("Singleton cache extraction requires index 0")
+            return copy.deepcopy(self.prompt_cache)
         return [c.extract(idx) for c in self.prompt_cache]
 
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
+        keep_singleton_cache = (
+            not self._supports_batching and len(self.uids) == 1 and keep == [0]
+        )
         self.uids = [self.uids[idx] for idx in keep]
         if not keep:
             self.prompt_cache.clear()
-        else:
+        elif not keep_singleton_cache:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
@@ -1778,6 +1829,25 @@ class BatchGenerator:
             stats.generation_tps = stats.generation_tokens / stats.generation_time
             stats.peak_memory = max(stats.peak_memory, mx.get_peak_memory() / 1e9)
 
+    def _preflight_batching(self, candidate_caches=()):
+        cache_sets = list(candidate_caches)
+        cache_sets.extend(sequence[3] for sequence in self._unprocessed_sequences)
+        if self._prompt_batch.uids:
+            cache_sets.append(self._prompt_batch.prompt_cache)
+        if self._generation_batch.uids:
+            cache_sets.append(self._generation_batch.prompt_cache)
+
+        if len(cache_sets) < 2:
+            return
+        if _supports_batching(self.model) and all(
+            _caches_support_batching(caches) for caches in cache_sets
+        ):
+            return
+        raise ValueError(
+            "BatchGenerator cannot batch multiple streams because the model or "
+            "prompt cache does not support batching"
+        )
+
     def insert(
         self,
         prompts: List[List[int]],
@@ -1814,6 +1884,9 @@ class BatchGenerator:
     ):
         uids = []
 
+        if not segments:
+            return uids
+
         max_tokens = max_tokens or [self.max_tokens] * len(segments)
         all_tokens = all_tokens or [[] for _ in segments]
         samplers = samplers or [None] * len(segments)
@@ -1824,10 +1897,12 @@ class BatchGenerator:
             [self._default_state_machine] * len(segments)
         )
 
-        caches = caches or [None] * len(segments)
+        caches = list(caches) if caches else [None] * len(segments)
         for i in range(len(segments)):
             if caches[i] is None:
                 caches[i] = self._make_new_cache()
+
+        self._preflight_batching(caches)
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,
@@ -1965,6 +2040,8 @@ class BatchGenerator:
     def _next(self):
         generation_responses = []
         prompt_responses = []
+
+        self._preflight_batching()
 
         # Generate tokens first
         if len(self._generation_batch) > 0:

@@ -8,9 +8,16 @@ fused Metal kernel (register-resident, one thread per token) and a pure-MLX
 reference path.
 """
 
+import os
+
 import mlx.core as mx
 
 _SINKHORN_KERNELS: dict = {}
+
+
+def _metal_sinkhorn_enabled() -> bool:
+    """Keep the custom Metal implementation opt-in until parity is proven."""
+    return os.environ.get("MLX_LM_ENABLE_HC_SINKHORN_METAL", "0") == "1"
 
 
 def _make_sinkhorn_kernel(hc: int, iters: int, eps: float):
@@ -110,7 +117,11 @@ def _make_hc_split_sinkhorn_fused_kernel():
     iterations into a single Metal dispatch. Replaces 4 dispatches with 1 on
     the hc_mult=4 fast path. Source ported from Blaizzy/mlx-lm#1192.
     """
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+    if (
+        not _metal_sinkhorn_enabled()
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+    ):
         return None
 
     source = """
@@ -185,7 +196,19 @@ def _make_hc_split_sinkhorn_fused_kernel():
     )
 
 
-_hc_split_sinkhorn_fused_kernel = _make_hc_split_sinkhorn_fused_kernel()
+_hc_split_sinkhorn_fused_kernel = None
+
+
+def _get_hc_split_sinkhorn_fused_kernel():
+    """Lazily create the opt-in fused kernel on its first eligible call."""
+    global _hc_split_sinkhorn_fused_kernel
+    if not _metal_sinkhorn_enabled():
+        return None
+    if _hc_split_sinkhorn_fused_kernel is None:
+        _hc_split_sinkhorn_fused_kernel = (
+            _make_hc_split_sinkhorn_fused_kernel()
+        )
+    return _hc_split_sinkhorn_fused_kernel
 
 
 def hc_split_sinkhorn(
@@ -206,15 +229,13 @@ def hc_split_sinkhorn(
     # Fast path: all-fused single-dispatch kernel for hc_mult=4 (DeepSeek-V4 default).
     # Combines pre/post sigmoid, comb scaling+softmax, and Sinkhorn iters into 1 GPU dispatch
     # (was 4 dispatches: pre sigmoid, post sigmoid, comb scaling, sinkhorn kernel).
-    if (
-        hc_mult == 4
-        and _hc_split_sinkhorn_fused_kernel is not None
-        and mx.metal.is_available()
-        and mixes.size > 0
-    ):
+    fused_kernel = (
+        _get_hc_split_sinkhorn_fused_kernel() if hc_mult == 4 else None
+    )
+    if fused_kernel is not None and mx.metal.is_available() and mixes.size > 0:
         n_rows = mixes.size // ((2 + hc_mult) * hc_mult)
         eps_arr = mx.array([eps], dtype=mx.float32)
-        return _hc_split_sinkhorn_fused_kernel(
+        return fused_kernel(
             inputs=[mixes, hc_scale, hc_base, eps_arr],
             template=[("HC", hc_mult), ("ITERS", sinkhorn_iters)],
             grid=(n_rows, 1, 1),
@@ -243,7 +264,8 @@ def hc_split_sinkhorn(
     post = 2 * mx.sigmoid(post_log)
 
     use_kernel = (
-        hc_mult <= 8
+        _metal_sinkhorn_enabled()
+        and hc_mult <= 8
         and mx.metal.is_available()
         and comb_log.size > 0
     )
